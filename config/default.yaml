@@ -15,7 +15,7 @@ data:
   trades_dir: "data/trades"
   # Databento settings (used if source is "databento" and file doesn't exist)
   databento:
-    api_key: ""
+    api_key: "db-BVgxKmCkKcGSJE6cgepnTcJnaPEqn"
     dataset: "GLBX.MDP3"
     symbol: "NQ.c.0"
     schema: "ohlcv-1m"
