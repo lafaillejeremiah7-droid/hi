@@ -1,0 +1,161 @@
+# NAS100 Backtesting Framework Configuration
+# =============================================
+# Configured for 5-minute NQ futures data with REAL order flow from Databento trades
+
+data:
+  # Data source: "real_orderflow", "databento", "yfinance", or "file"
+  source: "real_orderflow"
+  # Path to aggregated real order flow data file
+  data_file: "data/NQ_5min_real_orderflow.parquet"
+  # Path to footprint data (volume by price level per bar)
+  footprint_file: "data/NQ_5min_footprint.parquet"
+  # Legacy OHLCV file (fallback if real orderflow not available)
+  legacy_data_file: "data/NQ_5min_2021_2026.parquet"
+  # Raw trade files directory
+  trades_dir: "data/trades"
+  # Databento settings (used if source is "databento" and file doesn't exist)
+  databento:
+    api_key: ""
+    dataset: "GLBX.MDP3"
+    symbol: "NQ.c.0"
+    schema: "ohlcv-1m"
+    resample: "5min"
+    start: "2021-01-01"
+    end: "2026-08-01"
+    stype_in: "continuous"
+  # yfinance fallback settings
+  yfinance:
+    symbol: "NQ=F"
+    fallback_symbol: "^NDX"
+    period: "730d"
+    interval: "60m"
+  # Split ratios for 3.7 year coverage:
+  # Train: Jan 2021 - Dec 2022 (~2 years)
+  # Validation: Jan 2023 - Dec 2023 (~1 year)
+  # OOS: Jan 2024 - Sep 2024 (~9 months)
+  train_ratio: 0.54
+  validation_ratio: 0.27
+  # Legacy compatibility (deprecated, use train_ratio instead)
+  train_split: 0.6
+  # Timezone for session filtering
+  timezone: "US/Eastern"
+  # Cache directory for downloaded data
+  cache_dir: "data"
+
+# Walk-Forward Analysis for anti-overfitting validation
+walk_forward:
+  enabled: true
+  train_window_months: 6
+  test_window_months: 1
+  step_months: 2
+  anchored: false
+
+costs:
+  # Slippage in index points per trade (tighter for scalping)
+  slippage_points: 0.75
+  # Commission per round trip (entry + exit) in dollars
+  commission_per_round_trip: 4.50
+  # Dollar value per point for NQ futures
+  point_value: 20.0
+
+monte_carlo:
+  # Number of simulation paths
+  simulations: 10000
+  # Confidence level for reporting
+  confidence_level: 0.95
+  # Ruin threshold (fraction of peak equity lost)
+  ruin_threshold: 0.50
+  # Random seed for reproducibility (null for random)
+  seed: 42
+
+order_flow_strategy:
+  # Real absorption: both sides > Nx average volume
+  absorption_volume_threshold: 2.0
+  # Real delta divergence lookback (bars) - 12 bars = 1 hour on 5-min
+  delta_divergence_lookback: 12
+  # Real imbalance: one side >= Nx the other
+  imbalance_ratio: 3.0
+  # Minimum consecutive levels for stacked imbalance
+  min_stacked_bars: 3
+  # Failed auction volume threshold (fraction of average)
+  failed_auction_threshold: 0.1
+  # Trapped traders lookback for volume assessment
+  trapped_lookback: 6
+  # Trapped traders: volume at extremes threshold
+  trapped_extreme_volume_pct: 0.3
+  trapped_volume_threshold: 1.5
+  # Support/resistance zone width (fraction of ATR)
+  sr_zone_width: 1.5
+  # Stop loss multiplier (ATR-based)
+  stop_loss_atr_mult: 1.0
+  # Take profit multiplier (ATR-based)
+  take_profit_atr_mult: 1.5
+  # ATR period for calculations
+  atr_period: 14
+  # Minimum relative volume for signal validity
+  min_relative_volume: 0.8
+  # Minimum sub-signals needed
+  min_signal_strength: 1
+
+volume_profile_strategy:
+  # Number of bins for volume profile histogram
+  profile_bins: 30
+  # Lookback period for volume profile calculation - 78 bars = ~6.5 hours (1 session)
+  profile_lookback: 78
+  # Minimum volume concentration for a valid level (fraction of max)
+  min_volume_concentration: 0.6
+  # Trend detection period (bars) - 24 bars = 2 hours on 5-min
+  trend_period: 24
+  # Minimum trend strength (ADX threshold)
+  min_trend_strength: 20.0
+  # Rotation detection: max range as fraction of ATR
+  rotation_max_range_atr: 1.5
+  # Rotation minimum bars - 12 bars = 1 hour
+  rotation_min_bars: 12
+  # Support/resistance flip confirmation bars
+  sr_flip_confirmation_bars: 3
+  # Stop loss placement in low-volume area (ATR multiplier behind heavy volume)
+  stop_loss_atr_mult: 0.8
+  # Take profit at next heavy volume zone (look ahead bars for profile)
+  take_profit_lookback: 40
+  # ATR period
+  atr_period: 14
+
+combined_strategy:
+  # How many bars the OF signal can lag/lead the VP level signal
+  confirmation_window: 3
+  # Max trades per day (scalping: 1-2)
+  max_trades_per_day: 2
+  # Trading session start (Eastern Time)
+  trading_session_start: "09:30"
+  # Trading session end (Eastern Time)
+  trading_session_end: "16:00"
+  # Timezone for session filtering
+  session_timezone: "US/Eastern"
+  # Stop loss placement (ATR multiplier, uses VP logic)
+  stop_loss_atr_mult: 1.0
+  # Take profit lookback for VP-based target (bars)
+  take_profit_lookback: 50
+  # ATR period
+  atr_period: 14
+
+# Dynamic Exit Management System
+exit_management:
+  # Stop loss: fixed at 1.0 ATR (does not change)
+  stop_loss_atr_mult: 1.0
+  # Default take profit: 1.5 ATR
+  take_profit_atr_mult: 1.5
+  # Extended take profit when |delta_zscore| >= threshold: 2.5 ATR
+  extended_take_profit_atr_mult: 2.5
+  # Z-score threshold for extended TP
+  feature_zscore_threshold: 2.5
+  # Partial close: triggered at 1.0 ATR profit in trade direction
+  partial_close_atr_mult: 1.0
+  # Fraction of position to close at partial trigger
+  partial_close_fraction: 0.5
+  # Trailing stop distance (ATR multiplier from best price)
+  trailing_stop_atr_mult: 1.0
+  # Trailing stop activates after partial close
+  trailing_stop_activation: "partial_close"
+  # Rolling window for delta Z-score computation
+  delta_zscore_window: 50

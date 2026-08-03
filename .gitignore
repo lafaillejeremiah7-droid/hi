@@ -1,0 +1,42 @@
+# Data files
+data/*.parquet
+data/*.csv
+
+# Results
+results/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# UV
+.python-version
+
+# Databento trade data (too large for git)
+data/trades/
+
+# Agent files
+.agents/
+.kiro/
+.tasks/
+
+# Cache
+.pytest_cache/

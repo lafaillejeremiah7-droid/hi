@@ -1,0 +1,25 @@
+[project]
+name = "nas100-backtest"
+version = "0.1.0"
+description = "Comprehensive NAS100 backtesting framework with order flow and volume profile strategies"
+requires-python = ">=3.11"
+dependencies = [
+    "pandas>=2.0",
+    "numpy>=1.24",
+    "yfinance>=0.2.30",
+    "matplotlib>=3.7",
+    "plotly>=5.15",
+    "scipy>=1.11",
+    "pyyaml>=6.0",
+    "kaleido>=0.2.1",
+    "pyarrow>=14.0",
+    "databento>=0.82.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=7.4",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
