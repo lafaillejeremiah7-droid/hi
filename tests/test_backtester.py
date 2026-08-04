@@ -11,6 +11,7 @@ import pytest
 from src.backtester.costs import CostModel
 from src.backtester.engine import BacktestEngine, BacktestResult, Trade
 from src.strategies.order_flow_strategy import OrderFlowStrategy
+from src.strategies.simple_strategy import SimpleStrategy
 from src.strategies.volume_profile_strategy import VolumeProfileStrategy
 
 
@@ -898,3 +899,120 @@ class TestPartialExitCost:
         total_partial = partial_1 + partial_2
         assert abs(total_partial - full_cost) < 0.1
 
+
+class TestFixedOnlyExits:
+    """Tests for the fixed stop / fixed target configuration (no partials)."""
+
+    @staticmethod
+    def _make_data(prices: list[float]) -> tuple[pd.DataFrame, pd.Series]:
+        """Build bars from close prices with a long entry on bar 1."""
+        close = np.array(prices, dtype=float)
+        n = len(close)
+        df = pd.DataFrame(
+            {
+                "open": close,
+                "high": close + 0.5,
+                "low": close - 0.5,
+                "close": close,
+                "volume": np.ones(n) * 1000.0,
+                "delta": np.zeros(n),
+                "delta_zscore": np.zeros(n),
+            },
+            index=pd.date_range("2024-01-02 09:30", periods=n, freq="5min"),
+        )
+        signals = pd.Series(0, index=df.index, dtype=int)
+        signals.iloc[1] = 1
+        return df, signals
+
+    @staticmethod
+    def _engine(strategy, close_at_end: bool = False) -> BacktestEngine:
+        return BacktestEngine(
+            strategy,
+            CostModel(base_slippage_points=0.0, commission_per_round_trip=0.0),
+            exit_management={
+                "stop_loss_mode": "fixed",
+                "partial_close_enabled": False,
+            },
+            close_at_end=close_at_end,
+        )
+
+    def test_target_hit_gives_full_target_pnl(self):
+        """A winner books the whole fixed target with no partial close."""
+        strategy = SimpleStrategy(params={"stop_points": 20, "target_points": 30})
+        df, signals = self._make_data([100.0, 100.0, 110.0, 120.0, 131.0])
+        engine = self._engine(strategy)
+
+        trades, _, _ = engine._simulate(df, signals)
+
+        assert len(trades) == 1
+        assert trades[0].exit_reason == "take_profit"
+        assert trades[0].pnl_gross == pytest.approx(30.0)
+        assert trades[0].partial_close_pnl == 0.0
+        assert trades[0].trailing_exit_pnl == 0.0
+
+    def test_stop_hit_after_favourable_move_loses_full_stop(self):
+        """Without partial closes an unrealized gain is not booked at all."""
+        strategy = SimpleStrategy(params={"stop_points": 20, "target_points": 30})
+        # Runs 25 points in favour (past the old partial trigger) then stops out.
+        df, signals = self._make_data([100.0, 100.0, 125.0, 110.0, 79.0])
+        engine = self._engine(strategy)
+
+        trades, _, _ = engine._simulate(df, signals)
+
+        assert len(trades) == 1
+        assert trades[0].exit_reason == "stop_loss"
+        assert trades[0].pnl_gross == pytest.approx(-20.0)
+        assert trades[0].partial_close_pnl == 0.0
+
+    def test_no_trailing_exit_reasons(self):
+        """Trailing stops never fire when partial closes are disabled."""
+        strategy = SimpleStrategy(params={"stop_points": 20, "target_points": 60})
+        df, signals = self._make_data(
+            [100.0, 100.0, 120.0, 140.0, 125.0, 110.0, 100.0, 79.0]
+        )
+        engine = self._engine(strategy)
+
+        trades, _, _ = engine._simulate(df, signals)
+
+        assert len(trades) == 1
+        assert trades[0].exit_reason == "stop_loss"
+
+
+class TestCloseAtEnd:
+    """Tests for the forced close used by block-based splits."""
+
+    def test_open_position_closed_on_final_bar(self):
+        """close_at_end books the open position at the last bar's close."""
+        strategy = SimpleStrategy(params={"stop_points": 50, "target_points": 90})
+        df, signals = TestFixedOnlyExits._make_data([100.0, 100.0, 105.0, 112.0])
+        engine = TestFixedOnlyExits._engine(strategy, close_at_end=True)
+
+        trades, _, eq_net = engine._simulate(df, signals)
+
+        assert len(trades) == 1
+        assert trades[0].exit_reason == "block_end"
+        assert trades[0].exit_idx == len(df) - 1
+        assert trades[0].exit_price == pytest.approx(112.0)
+        assert trades[0].pnl_gross == pytest.approx(12.0)
+        assert float(eq_net.iloc[-1]) == pytest.approx(trades[0].pnl_net)
+
+    def test_open_position_dropped_without_close_at_end(self):
+        """Default behaviour still discards a position open on the last bar."""
+        strategy = SimpleStrategy(params={"stop_points": 50, "target_points": 90})
+        df, signals = TestFixedOnlyExits._make_data([100.0, 100.0, 105.0, 112.0])
+        engine = TestFixedOnlyExits._engine(strategy, close_at_end=False)
+
+        trades, _, _ = engine._simulate(df, signals)
+
+        assert trades == []
+
+    def test_closed_trade_not_double_counted(self):
+        """A position that already exited is not re-closed on the final bar."""
+        strategy = SimpleStrategy(params={"stop_points": 20, "target_points": 10})
+        df, signals = TestFixedOnlyExits._make_data([100.0, 100.0, 111.0, 112.0])
+        engine = TestFixedOnlyExits._engine(strategy, close_at_end=True)
+
+        trades, _, _ = engine._simulate(df, signals)
+
+        assert len(trades) == 1
+        assert trades[0].exit_reason == "take_profit"

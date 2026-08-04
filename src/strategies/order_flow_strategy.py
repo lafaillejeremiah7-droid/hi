@@ -418,7 +418,11 @@ class OrderFlowStrategy(BaseStrategy):
         return result
 
     def get_stop_loss(self, df: pd.DataFrame, idx: int, direction: int) -> float:
-        """Calculate ATR-based stop loss.
+        """Calculate stop loss price.
+
+        Supports two modes:
+        - "fixed": entry +/- fixed_points (from exit_management config)
+        - "atr": entry +/- ATR * multiplier (legacy mode)
 
         Args:
             df: Full DataFrame with data.
@@ -428,20 +432,29 @@ class OrderFlowStrategy(BaseStrategy):
         Returns:
             Stop loss price.
         """
-        atr = self._compute_atr(df, idx)
         entry_price = df["close"].iloc[idx]
-        mult = self.params["stop_loss_atr_mult"]
+        mode = self.params.get("stop_loss_mode", "atr")
 
-        if direction == 1:
-            return entry_price - atr * mult
+        if mode == "fixed":
+            fixed_points = self.params.get("stop_loss_fixed_points", 20)
+            if direction == 1:
+                return entry_price - fixed_points
+            else:
+                return entry_price + fixed_points
         else:
-            return entry_price + atr * mult
+            atr = self._compute_atr(df, idx)
+            mult = self.params["stop_loss_atr_mult"]
+            if direction == 1:
+                return entry_price - atr * mult
+            else:
+                return entry_price + atr * mult
 
     def get_take_profit(self, df: pd.DataFrame, idx: int, direction: int, feature_zscore: float | None = None) -> float:
-        """Calculate ATR-based take profit.
+        """Calculate take profit price.
 
-        If |feature_zscore| >= 2.5, uses extended TP multiplier (2.5x ATR).
-        Otherwise uses default TP multiplier (1.5x ATR).
+        Supports two modes:
+        - "fixed": entry +/- fixed_points (30 default, 50 when high Z-score)
+        - "atr": entry +/- ATR * multiplier (legacy mode)
 
         Args:
             df: Full DataFrame with data.
@@ -452,19 +465,30 @@ class OrderFlowStrategy(BaseStrategy):
         Returns:
             Take profit price.
         """
-        atr = self._compute_atr(df, idx)
         entry_price = df["close"].iloc[idx]
+        mode = self.params.get("stop_loss_mode", "atr")
 
-        # Determine TP multiplier based on feature Z-score
-        if feature_zscore is not None and abs(feature_zscore) >= 2.5:
-            mult = 2.5
+        if mode == "fixed":
+            zscore_threshold = self.params.get("feature_zscore_threshold", 2.5)
+            if feature_zscore is not None and abs(feature_zscore) >= zscore_threshold:
+                fixed_points = self.params.get("extended_take_profit_fixed_points", 50)
+            else:
+                fixed_points = self.params.get("take_profit_fixed_points", 30)
+            if direction == 1:
+                return entry_price + fixed_points
+            else:
+                return entry_price - fixed_points
         else:
-            mult = self.params["take_profit_atr_mult"]
-
-        if direction == 1:
-            return entry_price + atr * mult
-        else:
-            return entry_price - atr * mult
+            atr = self._compute_atr(df, idx)
+            # Determine TP multiplier based on feature Z-score
+            if feature_zscore is not None and abs(feature_zscore) >= 2.5:
+                mult = 2.5
+            else:
+                mult = self.params["take_profit_atr_mult"]
+            if direction == 1:
+                return entry_price + atr * mult
+            else:
+                return entry_price - atr * mult
 
     def _compute_atr(self, df: pd.DataFrame, idx: int) -> float:
         """Compute ATR at a specific bar."""

@@ -4,6 +4,13 @@ Processes strategy signals bar-by-bar, maintains position state,
 applies costs, and implements train/validation split with parameter
 optimization. Supports scalping features: session filtering,
 max trades per day, and time-based exits.
+
+Supports two stop loss modes:
+- "atr": ATR-based stops
+- "fixed": Fixed-point stops
+
+Partial close and trailing are optional (partial_close_enabled). With them
+disabled the simulation is a plain fixed stop / fixed target system.
 """
 
 from dataclasses import dataclass, field
@@ -31,7 +38,7 @@ class Trade:
     cost: float  # Total costs (in points)
     entry_time: Any = None
     exit_time: Any = None
-    exit_reason: str = ""  # stop_loss, take_profit, trailing_stop, partial_then_stop
+    exit_reason: str = ""  # stop_loss, take_profit, trailing_stop, partial_then_stop, block_end
     partial_close_pnl: float = 0.0  # P&L from the 50% partial close
     trailing_exit_pnl: float = 0.0  # P&L from the remaining 50% trailing exit
 
@@ -55,11 +62,10 @@ class BacktestEngine:
     """Event-driven backtesting engine.
 
     Processes signals bar-by-bar, tracking position state and
-    applying entry/exit logic with dynamic exit management:
-    - Stop loss: fixed ATR-based
-    - Take profit: dynamic based on delta Z-score at entry
-    - Partial close: 50% at 1.0 ATR profit
-    - Trailing stop: activated after partial close
+    applying entry/exit logic:
+    - Stop loss and take profit come from the strategy
+    - Partial close: 50% at configured profit distance (optional)
+    - Trailing stop: activated after partial close (optional)
 
     Produces dual equity curves (with and without costs).
 
@@ -69,7 +75,8 @@ class BacktestEngine:
     Features:
     - Session filter: only trade during specified hours
     - Max trades per day: cap daily entries
-    - Dynamic exit management (partial close + trailing stop)
+    - Optional partial close + trailing stop
+    - Optional forced close of any open position on the final bar
     """
 
     def __init__(
@@ -84,6 +91,7 @@ class BacktestEngine:
         trading_session_end: str | None = None,
         session_timezone: str = "US/Eastern",
         exit_management: dict | None = None,
+        close_at_end: bool = False,
     ):
         """Initialize backtest engine.
 
@@ -98,6 +106,9 @@ class BacktestEngine:
             trading_session_end: Session end time (HH:MM format).
             session_timezone: Timezone for session filtering.
             exit_management: Dict with exit management parameters.
+            close_at_end: If True, any position still open on the final bar is
+                closed at that bar's close (used for block-based splits so a
+                trade can never straddle a block boundary).
         """
         self.strategy = strategy
         self.cost_model = cost_model
@@ -109,9 +120,11 @@ class BacktestEngine:
         self.trading_session_start = trading_session_start
         self.trading_session_end = trading_session_end
         self.session_timezone = session_timezone
+        self.close_at_end = close_at_end
 
         # Exit management parameters
         em = exit_management or {}
+        self.stop_loss_mode = em.get("stop_loss_mode", "atr")
         self.stop_loss_atr_mult = em.get("stop_loss_atr_mult", 1.0)
         self.take_profit_atr_mult = em.get("take_profit_atr_mult", 1.5)
         self.extended_take_profit_atr_mult = em.get("extended_take_profit_atr_mult", 2.5)
@@ -119,6 +132,12 @@ class BacktestEngine:
         self.partial_close_atr_mult = em.get("partial_close_atr_mult", 1.0)
         self.partial_close_fraction = em.get("partial_close_fraction", 0.5)
         self.trailing_stop_atr_mult = em.get("trailing_stop_atr_mult", 1.0)
+        # Fixed-point parameters
+        self.stop_loss_fixed_points = em.get("stop_loss_fixed_points", 20)
+        self.partial_close_fixed_points = em.get("partial_close_fixed_points", 20)
+        self.trailing_stop_fixed_points = em.get("trailing_stop_fixed_points", 20)
+        # When False the position runs to the fixed stop or fixed target only.
+        self.partial_close_enabled = em.get("partial_close_enabled", True)
 
     def _is_within_session(self, timestamp) -> bool:
         """Check if a timestamp is within the trading session.
@@ -373,17 +392,31 @@ class BacktestEngine:
     def _simulate(
         self, df: pd.DataFrame, signals: pd.Series
     ) -> tuple[list[Trade], pd.Series, pd.Series]:
-        """Simulate trades bar-by-bar with dynamic exit management.
+        """Simulate trades bar-by-bar.
+
+        Args:
+            df: DataFrame with OHLCV data.
+            signals: Series of signals (1, -1, 0).
+
+        Returns:
+            Tuple of (trades list, gross equity curve, net equity curve).
+        """
+        return self._simulate_classic(df, signals)
+
+    def _simulate_classic(
+        self, df: pd.DataFrame, signals: pd.Series
+    ) -> tuple[list[Trade], pd.Series, pd.Series]:
+        """Simulate trades bar-by-bar.
 
         Implements:
         - Session filtering (skip signals outside trading hours)
         - Max trades per day (skip signals once daily limit reached)
-        - Dynamic take profit based on delta Z-score at entry
-        - Partial close at 1.0 ATR profit (50% of position)
-        - Trailing stop activated after partial close
+        - Stop loss and take profit taken from the strategy
+        - Partial close + trailing stop when partial_close_enabled is True
+        - Forced close on the final bar when close_at_end is True
         - No max_hold forced exit
 
-        Position phases:
+        Position phases (only when partial_close_enabled):
         - FULL: 100% position, waiting for partial close trigger or SL/TP
         - PARTIAL: 50% remaining after partial close, trailing stop active
 
@@ -505,11 +538,15 @@ class BacktestEngine:
                     partial_close_cost = 0.0
                     best_price_since_entry = entry_price
 
-                    # Partial close trigger price: entry + 1.0 ATR in trade direction
-                    if position == 1:
-                        partial_close_trigger = entry_price + entry_atr * self.partial_close_atr_mult
+                    # Partial close trigger price
+                    if self.stop_loss_mode == "fixed":
+                        partial_dist = self.partial_close_fixed_points
                     else:
-                        partial_close_trigger = entry_price - entry_atr * self.partial_close_atr_mult
+                        partial_dist = entry_atr * self.partial_close_atr_mult
+                    if position == 1:
+                        partial_close_trigger = entry_price + partial_dist
+                    else:
+                        partial_close_trigger = entry_price - partial_dist
 
                     trailing_stop_price = 0.0
             else:
@@ -534,7 +571,10 @@ class BacktestEngine:
                             # Full stop loss hit - close entire position
                             exit_price = stop_loss
                             exit_reason = "stop_loss"
-                        elif current_high >= partial_close_trigger:
+                        elif (
+                            self.partial_close_enabled
+                            and current_high >= partial_close_trigger
+                        ):
                             # Partial close triggered - book 50% profit
                             partial_exit_price = partial_close_trigger
                             partial_pnl_gross = (partial_exit_price - entry_price) * self.partial_close_fraction
@@ -558,7 +598,11 @@ class BacktestEngine:
                             best_price_since_entry = current_high
 
                             # Activate trailing stop
-                            trailing_stop_price = best_price_since_entry - entry_atr * self.trailing_stop_atr_mult
+                            if self.stop_loss_mode == "fixed":
+                                trailing_dist = self.trailing_stop_fixed_points
+                            else:
+                                trailing_dist = entry_atr * self.trailing_stop_atr_mult
+                            trailing_stop_price = best_price_since_entry - trailing_dist
 
                             # Also check if TP was hit on the same bar
                             if current_high >= take_profit:
@@ -575,7 +619,10 @@ class BacktestEngine:
                             # Full stop loss hit
                             exit_price = stop_loss
                             exit_reason = "stop_loss"
-                        elif current_low <= partial_close_trigger:
+                        elif (
+                            self.partial_close_enabled
+                            and current_low <= partial_close_trigger
+                        ):
                             # Partial close triggered
                             partial_exit_price = partial_close_trigger
                             partial_pnl_gross = (entry_price - partial_exit_price) * self.partial_close_fraction
@@ -598,7 +645,11 @@ class BacktestEngine:
                             best_price_since_entry = current_low
 
                             # Activate trailing stop
-                            trailing_stop_price = best_price_since_entry + entry_atr * self.trailing_stop_atr_mult
+                            if self.stop_loss_mode == "fixed":
+                                trailing_dist = self.trailing_stop_fixed_points
+                            else:
+                                trailing_dist = entry_atr * self.trailing_stop_atr_mult
+                            trailing_stop_price = best_price_since_entry + trailing_dist
 
                             # Also check if TP hit on same bar
                             if current_low <= take_profit:
@@ -613,8 +664,13 @@ class BacktestEngine:
                 else:
                     # PHASE 2: Partial position (50% remaining) - trailing stop active
                     # Update trailing stop (only moves in profitable direction)
+                    if self.stop_loss_mode == "fixed":
+                        trailing_dist = self.trailing_stop_fixed_points
+                    else:
+                        trailing_dist = entry_atr * self.trailing_stop_atr_mult
+
                     if position == 1:
-                        new_trailing = best_price_since_entry - entry_atr * self.trailing_stop_atr_mult
+                        new_trailing = best_price_since_entry - trailing_dist
                         trailing_stop_price = max(trailing_stop_price, new_trailing)
 
                         # Check trailing stop hit
@@ -629,7 +685,7 @@ class BacktestEngine:
                             exit_price = stop_loss
                             exit_reason = "partial_then_stop"
                     else:
-                        new_trailing = best_price_since_entry + entry_atr * self.trailing_stop_atr_mult
+                        new_trailing = best_price_since_entry + trailing_dist
                         trailing_stop_price = min(trailing_stop_price, new_trailing)
 
                         # Check trailing stop hit
@@ -782,6 +838,54 @@ class BacktestEngine:
 
             equity_gross_arr[i] = cumulative_gross
             equity_net_arr[i] = cumulative_net
+
+        # Forced close of any position still open on the final bar. Used for
+        # block-based splits so a trade can never straddle a block boundary.
+        if self.close_at_end and position != 0 and n > 0:
+            last = n - 1
+            exit_price = close[last]
+            remaining_fraction = (
+                1.0 - self.partial_close_fraction if partial_close_done else 1.0
+            )
+            remaining_pnl_gross = (
+                (exit_price - entry_price) * position * remaining_fraction
+            )
+            entry_vol = tr_arr[entry_idx] if entry_idx < n else avg_volatility[last]
+            remaining_cost = self.cost_model.partial_exit_cost(
+                entry_price=entry_price,
+                exit_price=exit_price,
+                direction=position,
+                entry_volatility=entry_vol,
+                exit_volatility=tr_arr[last],
+                avg_volatility=avg_volatility[last],
+                fraction=remaining_fraction,
+            )
+            pnl_gross = partial_close_pnl + remaining_pnl_gross
+            total_cost = partial_close_cost + remaining_cost
+            pnl_net = pnl_gross - total_cost
+
+            trades.append(
+                Trade(
+                    entry_idx=entry_idx,
+                    exit_idx=last,
+                    entry_price=entry_price,
+                    exit_price=exit_price,
+                    direction=position,
+                    pnl_gross=pnl_gross,
+                    pnl_net=pnl_net,
+                    cost=total_cost,
+                    entry_time=df.index[entry_idx] if dates_arr is not None else None,
+                    exit_time=df.index[last] if dates_arr is not None else None,
+                    exit_reason="block_end",
+                    partial_close_pnl=partial_close_pnl if partial_close_done else 0.0,
+                    trailing_exit_pnl=remaining_pnl_gross if partial_close_done else 0.0,
+                )
+            )
+
+            cumulative_gross += pnl_gross
+            cumulative_net += pnl_net
+            equity_gross_arr[last] = cumulative_gross
+            equity_net_arr[last] = cumulative_net
 
         equity_gross = pd.Series(equity_gross_arr, index=df.index)
         equity_net = pd.Series(equity_net_arr, index=df.index)

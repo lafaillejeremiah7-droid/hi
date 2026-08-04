@@ -1,194 +1,147 @@
 # NAS100 Backtesting Framework
 
-A comprehensive Python backtesting framework for NASDAQ 100 futures (NQ) implementing two distinct trading strategies with proper backtesting methodology: realistic cost modeling, train/validation split for overfitting prevention, and Monte Carlo simulation for robustness assessment.
+Backtesting framework for NASDAQ 100 futures (NQ) on 5-minute bars with **real
+order flow** (bid/ask volume and delta aggregated from Databento trades).
 
-## Features
-
-- **Two trading strategies**: Order Flow and Volume Profile
-- **Realistic cost modeling**: Volatility-based slippage (0.5-2 points) and configurable commissions
-- **Train/validation split**: Parameter optimization on training data only, validation with fixed parameters
-- **Monte Carlo simulation**: 10,000 randomized trade sequences for robustness testing
-- **Interactive HTML reports**: Plotly-based visualizations with equity curves, Monte Carlo paths, and metrics tables
-- **Configurable via YAML**: All strategy parameters, costs, and simulation settings in one config file
+The pipeline runs one deliberately simple strategy and validates it honestly:
+interleaved-block train/validation/OOS split, look-ahead regression tests,
+walk-forward analysis, Monte Carlo, and a FundedNext 50K prop-firm sizing
+analysis that respects the contract cap and the daily loss limit.
 
 ## Quick Start
 
-### Prerequisites
-
-- Python 3.11+
-- [uv](https://docs.astral.sh/uv/) package manager
-
-### Setup
-
 ```bash
-# Clone the repository
-git clone <repo-url>
-cd nas100-backtest
-
-# Install dependencies
 uv sync
+uv run python -m src.main        # full pipeline
+uv run pytest tests/ -q          # test suite
 ```
 
-### Run the Backtest
+Data: `data/NQ_5min_real_orderflow.parquet` (264,057 bars, Jan 2021 - Sep 2024).
+Columns: `open, high, low, close, volume, bid_volume, ask_volume, delta,
+trade_count, avg_trade_size`, where `delta = bid_volume - ask_volume` so a
+**positive delta means net buying**.
 
-```bash
-uv run python -m src.main
-```
+## The Strategy
 
-This will:
-1. Download 5 years of NAS100 data (via yfinance)
-2. Preprocess data with order flow and volume profile indicators
-3. Run both strategies with train/validation split (60%/40%)
-4. Perform Monte Carlo simulation (10,000 paths)
-5. Generate HTML reports in `results/`
-6. Save trade logs as CSV files
+`SimpleStrategy` (`src/strategies/simple_strategy.py`) has exactly two entry
+conditions - the core idea shared by the order flow and volume profile
+methodologies:
 
-### Run Tests
+1. **Level** - price is within `level_proximity_points` of the heavy-volume
+   node: the price bin that traded the most volume over the last
+   `profile_lookback` bars. That is where institutions positioned.
+2. **Confirmation** - the rolling delta Z-score at that level says which side
+   is winning. Positive delta while price sits at or above the node (support)
+   is a long; negative delta at or below the node (resistance) is a short.
 
-```bash
-uv run pytest tests/ -v
-```
+Exits are fixed points only: `stop_points` and `target_points`. No partial
+closes, no trailing stop, no staged stop advancement, no time-based exit.
+
+The entire tunable surface:
+
+| Parameter | Default | Meaning |
+|-----------|---------|---------|
+| `profile_lookback` | 78 | Bars in the volume profile window (one 6.5h session) |
+| `level_proximity_points` | 10 | How close price must be to the node |
+| `delta_threshold` | 1.0 | Minimum absolute delta Z-score |
+| `stop_points` | 20 | Fixed stop distance |
+| `target_points` | 30 | Fixed target distance |
+| `max_trades_per_day` | 2 | Daily entry cap (enforced by the engine) |
+| `trading_session_start` / `_end` | 09:30 / 16:00 ET | Session filter |
+
+Two constants are fixed by the instrument rather than tuned: the profile bin
+width (5 points) and the delta Z-score window (50 bars).
+
+`OrderFlowStrategy` and `VolumeProfileStrategy` are kept only as **baselines**
+for the OOS comparison table the pipeline prints.
+
+## Validation Design
+
+### Interleaved-block split
+
+The timeline is cut into consecutive 1-month blocks assigned round-robin:
+`train, train, validation, oos`. Each split therefore spans 2021 through 2024
+instead of one contiguous era (~50% / 25% / 25% of bars). Every block's exact
+date range and bar count is printed so the split is auditable.
+
+Each block is simulated on its own, so **no trade straddles a block
+boundary**: a position still open on a block's last bar is closed at that
+bar's close (`close_at_end`) and recorded in that block's split.
+
+The pipeline prints a warning about a real artifact of this scheme: a 4-long
+assignment cycle divides evenly into the 12-month year, so each split always
+receives the same calendar months (train = Jan/Feb/May/Jun/Sep/Oct,
+validation = Mar/Jul/Nov, OOS = Apr/Aug/Dec). Month-of-year seasonality is
+perfectly confounded with the split.
+
+### Parameter selection
+
+The only tuning allowed: score the 4x5x3x2 = 120 grid combinations on **train
+only**, promote the top 5 to **validation**, lock the single best, then touch
+**OOS once**. Train, validation and OOS are printed side by side so
+degradation is visible.
+
+### Look-ahead guards
+
+`tests/test_lookahead.py` asserts that the signal at bar *i* is unchanged when
+every bar after *i* is deleted (and separately when it is replaced with
+noise), for the strategy, the volume profile level, and the delta Z-score.
+
+## Prop Firm Analysis (FundedNext 50K)
+
+Rules modelled: $50,000 account, $3,000 profit target, $1,000 daily loss
+limit, $48,000 equity floor, up to 40 Micro ($2/pt) or 4 Mini ($20/pt).
+
+1. **Hard filter** - one stop-out costs `stop_points x $/pt x contracts`. Any
+   size where a single stop-out exceeds the $1,000 daily limit is eliminated
+   before any simulation, and the eliminated range is stated explicitly.
+2. **Monte Carlo** - for every surviving size, 10,000 simulated 250-day years.
+   Trades are resampled from the OOS trade list and replayed one at a time;
+   the daily loss limit and the equity floor are **hard fails checked inside
+   the loop**. A breached account is dead and keeps the equity it had at that
+   instant. Nothing is capped after the fact.
+3. **Arithmetic ceiling** - what 40 Micro, the observed trades/day and the OOS
+   EV/trade would produce with zero losing days and no compounding. This is
+   the hard upper bound the contract cap imposes, and it is compared directly
+   against the 11,376% figure this project was previously asked to justify.
 
 ## Project Structure
 
 ```
-.
-├── config/
-│   └── default.yaml          # All configurable parameters
-├── data/                     # Cached market data (auto-created, gitignored)
-├── results/                  # Generated reports and trade logs (gitignored)
-│   ├── order_flow_report.html
-│   ├── order_flow_trades.csv
-│   ├── volume_profile_report.html
-│   └── volume_profile_trades.csv
-├── src/
-│   ├── analysis/
-│   │   ├── metrics.py        # Performance metrics (Sharpe, drawdown, etc.)
-│   │   └── monte_carlo.py    # Monte Carlo simulation engine
-│   ├── backtester/
-│   │   ├── costs.py          # Slippage and commission modeling
-│   │   └── engine.py         # Core backtesting engine with train/val split
-│   ├── data/
-│   │   ├── fetcher.py        # Market data download (yfinance)
-│   │   └── preprocessor.py   # Order flow proxy calculation
-│   ├── indicators/
-│   │   ├── order_flow.py     # Order flow indicator functions
-│   │   └── volume_profile.py # Volume profile indicator functions
-│   ├── reports/
-│   │   └── generator.py      # HTML report generation (Plotly)
-│   ├── strategies/
-│   │   ├── base.py           # Abstract base strategy class
-│   │   ├── order_flow_strategy.py
-│   │   └── volume_profile_strategy.py
-│   ├── config.py             # Configuration loader
-│   └── main.py               # Pipeline orchestrator
-├── tests/
-│   ├── test_backtester.py
-│   ├── test_indicators.py
-│   ├── test_monte_carlo.py
-│   └── test_strategies.py
-├── pyproject.toml
-└── README.md
+config/default.yaml              All parameters, grid and prop firm rules
+src/
+  strategies/
+    simple_strategy.py           PRIMARY strategy (level + delta)
+    order_flow_strategy.py       baseline
+    volume_profile_strategy.py   baseline
+    base.py
+  backtester/
+    engine.py                    Bar-by-bar simulation, session + daily caps
+    block_split.py               Interleaved-block split and per-block runs
+    costs.py                     Volatility-scaled slippage + commission
+  analysis/
+    parameter_selection.py       Train -> validation -> lock
+    prop_firm.py                 FN 50K sizing, MC, arithmetic ceiling
+    walk_forward.py              Rolling walk-forward windows
+    metrics.py, monte_carlo.py
+  data/                          Fetching, trade aggregation, preprocessing
+  indicators/                    order_flow.py, volume_profile.py
+  reports/generator.py           Plotly HTML reports
+  main.py                        Pipeline orchestrator
+tests/                           Unit, look-ahead and split regression tests
 ```
 
-## Configuration Guide
+## Known Caveats
 
-All parameters are in `config/default.yaml`:
+These are printed by the pipeline as well:
 
-### Data Section
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `symbol` | `NQ=F` | Primary yfinance symbol for NQ futures |
-| `fallback_symbol` | `^NDX` | Fallback if primary fails |
-| `period` | `5y` | Data history length |
-| `interval` | `1d` | Bar interval (daily) |
-| `train_split` | `0.6` | Fraction of data for training |
-| `cache_dir` | `data` | Directory for cached data |
-
-### Costs Section
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `slippage_points` | `1.0` | Base slippage per trade (scales with volatility) |
-| `commission_per_round_trip` | `4.50` | Commission in dollars per round trip |
-| `point_value` | `20.0` | Dollar value per point (NQ micro = $20) |
-
-### Monte Carlo Section
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `simulations` | `10000` | Number of simulation paths |
-| `confidence_level` | `0.95` | Confidence level for intervals |
-| `ruin_threshold` | `0.50` | Fraction of equity loss defining ruin |
-| `seed` | `42` | Random seed for reproducibility |
-
-### Strategy Sections
-
-See `config/default.yaml` for the full list of `order_flow_strategy` and `volume_profile_strategy` parameters including thresholds, lookback periods, and ATR multipliers.
-
-## Strategy Descriptions
-
-### Order Flow Strategy
-
-Combines five order flow proxy signals derived from OHLCV data:
-
-1. **Absorption**: Detects high volume at support/resistance zones where buying/selling pressure is being absorbed, signaling potential reversals.
-2. **Cumulative Delta Divergence**: Identifies divergences between price direction and cumulative buying/selling pressure.
-3. **Stacked Imbalances**: Finds consecutive bars where one side of volume is 3x more aggressive, creating strong S/R zones.
-4. **Failed Auctions**: Detects candles with improper auction completion, identifying price levels likely to be revisited.
-5. **Trapped Traders**: Spots heavy volume at candle extremes followed by reversals, catching traders on the wrong side.
-
-Signals are only valid when they occur at pre-identified support/resistance zones. A minimum of 2 sub-signals must align to generate a trade.
-
-### Volume Profile Strategy
-
-Three setups based on volume distribution analysis:
-
-1. **Volume Accumulation**: Finds consolidation zones with heavy volume, then enters on pullback to the high-volume node after a breakout.
-2. **Trend Setup**: During strong trends, identifies volume clusters where institutions added positions and enters on pullback to those levels.
-3. **Support/Resistance Flip**: Trades when previously heavy support zones become resistance (or vice versa).
-
-Stop losses are placed in low-volume areas (where price moves fast), and take profits at the next heavy-volume zone (natural barriers).
-
-## Methodology Notes
-
-### OHLCV Proxy Approach
-
-Since true order flow data (Level 2, time and sales) is not freely available for 5+ years, this framework uses OHLCV-based proxies:
-
-- **Volume Delta Proxy**: If close > open, more volume is attributed to the ask (buying); if close < open, to the bid (selling).
-- **Absorption Proxy**: High relative volume at known S/R levels serves as an absorption signal.
-- **Imbalance Proxy**: Relative volume comparisons between adjacent bars model order flow imbalances.
-- **Volume Profile**: Built from price-weighted volume distribution across bars in a lookback window.
-
-These proxies are less precise than true order flow data but capture the same underlying dynamics when applied to daily bars over a 5-year period.
-
-### Backtesting Methodology
-
-The framework follows four key rules for proper backtesting:
-
-1. **Realistic Costs**: Volatility-scaled slippage (higher volatility = worse fills) plus fixed commissions. Equity curves shown both with and without costs.
-2. **Long Time Period**: 5 years of data ensures strategies are tested across multiple market regimes.
-3. **Train/Validation Split**: Parameters are optimized only on the first 60% of data. The last 40% tests with locked parameters to detect overfitting.
-4. **Monte Carlo Simulation**: Randomizes trade sequences to assess robustness beyond the specific historical ordering.
-
-## Output
-
-After running the pipeline, the `results/` directory contains:
-
-- `order_flow_report.html` - Full interactive report for Order Flow strategy
-- `order_flow_trades.csv` - Individual trade log with entry/exit times and P&L
-- `volume_profile_report.html` - Full interactive report for Volume Profile strategy
-- `volume_profile_trades.csv` - Individual trade log
-
-Each HTML report includes:
-- Equity curves (gross vs net, overlaid)
-- Train vs validation performance side-by-side
-- Monte Carlo simulation paths with confidence bands
-- Final equity distribution histogram
-- Complete metrics tables for both periods
-- Optimized parameters from training
+- **Overnight holds.** Bars outside 09:30-16:00 ET are filtered out before the
+  strategy runs, so a position held past the close never has its stop tested
+  against the overnight tape. The pipeline reports how many trades and how
+  much P&L this affects.
+- **Month confounding.** See the split section above.
+- **The contract cap dominates the return question.** Because the maximum size
+  does not grow with equity, returns accumulate linearly, not exponentially.
 
 ## License
 

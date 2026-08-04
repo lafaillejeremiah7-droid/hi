@@ -20,6 +20,11 @@ from src.indicators.order_flow import (
     detect_trapped_traders,
 )
 from src.strategies.order_flow_strategy import OrderFlowStrategy
+from src.strategies.simple_strategy import (
+    SimpleStrategy,
+    heavy_volume_node,
+    rolling_delta_zscore,
+)
 from src.strategies.volume_profile_strategy import VolumeProfileStrategy
 
 
@@ -325,4 +330,129 @@ class TestIndicatorsNoLookahead:
             corrupted = detect_stacked_imbalances(corrupted_df)
             assert original.iloc[bar_idx] == corrupted.iloc[bar_idx], (
                 f"Stacked imbalance signal at bar {bar_idx} depends on future data."
+            )
+
+
+def make_orderflow_test_data(n: int = 400, seed: int = 11) -> pd.DataFrame:
+    """Create 5-min data with a real order flow delta column.
+
+    Args:
+        n: Number of bars.
+        seed: Random seed.
+
+    Returns:
+        DataFrame with OHLCV, bid_volume, ask_volume and delta.
+    """
+    rng = np.random.default_rng(seed)
+    dates = pd.date_range("2024-01-02 09:30", periods=n, freq="5min")
+
+    base = np.cumsum(rng.normal(0.0, 4.0, n)) + 18000
+    open_p = base + rng.normal(0, 1.0, n)
+    close_p = base + rng.normal(0, 1.0, n)
+    high_p = np.maximum(open_p, close_p) + np.abs(rng.normal(0, 3.0, n))
+    low_p = np.minimum(open_p, close_p) - np.abs(rng.normal(0, 3.0, n))
+    volume = rng.uniform(1000, 5000, n)
+    bid_volume = volume * rng.uniform(0.3, 0.7, n)
+    ask_volume = volume - bid_volume
+
+    return pd.DataFrame(
+        {
+            "open": open_p,
+            "high": high_p,
+            "low": low_p,
+            "close": close_p,
+            "volume": volume,
+            "bid_volume": bid_volume,
+            "ask_volume": ask_volume,
+            "delta": bid_volume - ask_volume,
+        },
+        index=dates,
+    )
+
+
+class TestSimpleStrategyNoLookahead:
+    """Verify SimpleStrategy signals depend only on data at or before bar i."""
+
+    def test_signals_unchanged_when_future_deleted(self):
+        """Signal at bar i is identical when every bar after i is deleted."""
+        df = make_orderflow_test_data(400)
+        strategy = SimpleStrategy()
+        full_signals = strategy.generate_signals(df)["signal"]
+
+        signal_bars = full_signals[full_signals != 0].index
+        assert len(signal_bars) > 0, "Fixture produced no signals to test"
+
+        for bar_label in signal_bars[:15]:
+            bar_idx = df.index.get_loc(bar_label)
+            truncated = df.iloc[: bar_idx + 1].copy()
+            truncated_signals = strategy.generate_signals(truncated)["signal"]
+
+            assert full_signals.iloc[bar_idx] == truncated_signals.iloc[bar_idx], (
+                f"SimpleStrategy signal at bar {bar_idx} changed when all data "
+                f"after bar {bar_idx} was deleted. This indicates lookahead bias."
+            )
+
+    def test_flat_bars_also_unchanged_when_future_deleted(self):
+        """Bars with no signal must also stay signal-free after truncation."""
+        df = make_orderflow_test_data(400)
+        strategy = SimpleStrategy()
+        full_signals = strategy.generate_signals(df)["signal"]
+
+        for bar_idx in range(200, 260):
+            truncated = df.iloc[: bar_idx + 1].copy()
+            truncated_signals = strategy.generate_signals(truncated)["signal"]
+            assert full_signals.iloc[bar_idx] == truncated_signals.iloc[bar_idx], (
+                f"SimpleStrategy signal at bar {bar_idx} changed after truncation."
+            )
+
+    def test_heavy_volume_node_unchanged_when_future_deleted(self):
+        """The volume profile level at bar i uses bars <= i only."""
+        df = make_orderflow_test_data(400)
+        full_node = heavy_volume_node(df, lookback=78)
+
+        for bar_idx in [100, 150, 200, 275, 399]:
+            truncated_node = heavy_volume_node(df.iloc[: bar_idx + 1], lookback=78)
+            assert full_node.iloc[bar_idx] == truncated_node.iloc[bar_idx], (
+                f"Heavy volume node at bar {bar_idx} depends on future data."
+            )
+
+    def test_delta_zscore_unchanged_when_future_deleted(self):
+        """The delta Z-score at bar i uses bars <= i only."""
+        df = make_orderflow_test_data(400)
+        full_z = rolling_delta_zscore(df)
+
+        for bar_idx in [100, 150, 200, 275, 399]:
+            truncated_z = rolling_delta_zscore(df.iloc[: bar_idx + 1])
+            assert full_z.iloc[bar_idx] == pytest.approx(truncated_z.iloc[bar_idx]), (
+                f"Delta Z-score at bar {bar_idx} depends on future data."
+            )
+
+    def test_signals_unchanged_when_future_corrupted(self):
+        """Signal at bar i survives replacing future bars with noise."""
+        df = make_orderflow_test_data(400)
+        strategy = SimpleStrategy()
+        full_signals = strategy.generate_signals(df)["signal"]
+
+        signal_bars = full_signals[full_signals != 0].index
+        assert len(signal_bars) > 0, "Fixture produced no signals to test"
+
+        rng = np.random.default_rng(99)
+        for bar_label in signal_bars[:15]:
+            bar_idx = df.index.get_loc(bar_label)
+            corrupted = df.copy()
+            n_future = len(df) - bar_idx - 1
+            if n_future <= 0:
+                continue
+            noise = rng.uniform(5000, 6000, n_future)
+            corrupted.iloc[bar_idx + 1 :, corrupted.columns.get_loc("open")] = noise
+            corrupted.iloc[bar_idx + 1 :, corrupted.columns.get_loc("close")] = noise
+            corrupted.iloc[bar_idx + 1 :, corrupted.columns.get_loc("high")] = noise + 10
+            corrupted.iloc[bar_idx + 1 :, corrupted.columns.get_loc("low")] = noise - 10
+            corrupted.iloc[bar_idx + 1 :, corrupted.columns.get_loc("volume")] = 9e6
+            corrupted.iloc[bar_idx + 1 :, corrupted.columns.get_loc("delta")] = 9e6
+
+            corrupted_signals = strategy.generate_signals(corrupted)["signal"]
+            assert full_signals.iloc[bar_idx] == corrupted_signals.iloc[bar_idx], (
+                f"SimpleStrategy signal at bar {bar_idx} changed when future data "
+                f"was corrupted. This indicates lookahead bias."
             )

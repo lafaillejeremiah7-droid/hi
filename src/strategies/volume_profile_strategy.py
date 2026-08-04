@@ -180,10 +180,11 @@ class VolumeProfileStrategy(BaseStrategy):
         return result
 
     def get_stop_loss(self, df: pd.DataFrame, idx: int, direction: int) -> float:
-        """Calculate stop loss in low-volume area behind traded zone.
+        """Calculate stop loss price.
 
-        Places stop loss beyond the high-volume node being traded,
-        scaled by ATR.
+        Supports two modes:
+        - "fixed": entry +/- fixed_points (from exit_management config)
+        - "atr": entry +/- ATR * multiplier (legacy, places stop in low-volume area)
 
         Args:
             df: Full DataFrame.
@@ -193,26 +194,29 @@ class VolumeProfileStrategy(BaseStrategy):
         Returns:
             Stop loss price.
         """
-        atr = self._compute_atr(df, idx)
         entry_price = df["close"].iloc[idx]
-        mult = self.params["stop_loss_atr_mult"]
+        mode = self.params.get("stop_loss_mode", "atr")
 
-        if direction == 1:
-            return entry_price - atr * mult
+        if mode == "fixed":
+            fixed_points = self.params.get("stop_loss_fixed_points", 20)
+            if direction == 1:
+                return entry_price - fixed_points
+            else:
+                return entry_price + fixed_points
         else:
-            return entry_price + atr * mult
+            atr = self._compute_atr(df, idx)
+            mult = self.params["stop_loss_atr_mult"]
+            if direction == 1:
+                return entry_price - atr * mult
+            else:
+                return entry_price + atr * mult
 
     def get_take_profit(self, df: pd.DataFrame, idx: int, direction: int, feature_zscore: float | None = None) -> float:
-        """Calculate take profit using backward-looking volume profile levels.
+        """Calculate take profit price.
 
-        Uses the nearest high-volume node from the backward-looking volume
-        profile in the direction of the trade as a target. Falls back to an
-        ATR-based target if no suitable level is found.
-
-        If |feature_zscore| >= 2.5, uses extended minimum TP distance (2.5x ATR).
-
-        This avoids lookahead bias by only using data available at entry time
-        (bars 0..idx).
+        Supports two modes:
+        - "fixed": entry +/- fixed_points (30 default, 50 when high Z-score)
+        - "atr": Uses backward-looking volume profile levels (legacy)
 
         Args:
             df: Full DataFrame.
@@ -223,57 +227,58 @@ class VolumeProfileStrategy(BaseStrategy):
         Returns:
             Take profit price.
         """
-        atr = self._compute_atr(df, idx)
         entry_price = df["close"].iloc[idx]
-        lookback = self.params["take_profit_lookback"]
+        mode = self.params.get("stop_loss_mode", "atr")
 
-        # Determine minimum TP distance based on feature Z-score
-        if feature_zscore is not None and abs(feature_zscore) >= 2.5:
-            min_atr_mult = 2.5
-        else:
-            min_atr_mult = 1.5
-
-        # Use backward-looking data only (bars up to and including idx)
-        start_idx = max(0, idx - lookback)
-        segment = df.iloc[start_idx : idx + 1]
-
-        if len(segment) > 1:
-            # Find the nearest high-volume node from historical data
-            # that lies in the direction of the trade
-            vol_weighted_prices = (segment["close"] * segment["volume"]).values
-            volumes = segment["volume"].values
-
-            if direction == 1:
-                # For longs, find a resistance level above entry from
-                # historical highs weighted by volume
-                above_entry = segment[segment["high"] > entry_price]
-                if len(above_entry) > 0:
-                    # Use the volume-weighted average of highs above entry
-                    # as the target (represents where heavy trading occurred)
-                    weights = above_entry["volume"].values
-                    if weights.sum() > 0:
-                        target = np.average(above_entry["high"].values, weights=weights)
-                    else:
-                        target = above_entry["high"].mean()
-                    # Ensure target is at least min_atr_mult ATR away
-                    min_target = entry_price + atr * min_atr_mult
-                    return max(target, min_target)
+        if mode == "fixed":
+            zscore_threshold = self.params.get("feature_zscore_threshold", 2.5)
+            if feature_zscore is not None and abs(feature_zscore) >= zscore_threshold:
+                fixed_points = self.params.get("extended_take_profit_fixed_points", 50)
             else:
-                # For shorts, find a support level below entry from
-                # historical lows weighted by volume
-                below_entry = segment[segment["low"] < entry_price]
-                if len(below_entry) > 0:
-                    weights = below_entry["volume"].values
-                    if weights.sum() > 0:
-                        target = np.average(below_entry["low"].values, weights=weights)
-                    else:
-                        target = below_entry["low"].mean()
-                    # Ensure target is at least min_atr_mult ATR away
-                    max_target = entry_price - atr * min_atr_mult
-                    return min(target, max_target)
+                fixed_points = self.params.get("take_profit_fixed_points", 30)
+            if direction == 1:
+                return entry_price + fixed_points
+            else:
+                return entry_price - fixed_points
+        else:
+            # Legacy ATR-based / volume-profile-based logic
+            atr = self._compute_atr(df, idx)
+            lookback = self.params["take_profit_lookback"]
 
-        # Fallback: ATR-based target (2x ATR from entry)
-        return entry_price + direction * atr * 2.0
+            # Determine minimum TP distance based on feature Z-score
+            if feature_zscore is not None and abs(feature_zscore) >= 2.5:
+                min_atr_mult = 2.5
+            else:
+                min_atr_mult = 1.5
+
+            # Use backward-looking data only (bars up to and including idx)
+            start_idx = max(0, idx - lookback)
+            segment = df.iloc[start_idx : idx + 1]
+
+            if len(segment) > 1:
+                if direction == 1:
+                    above_entry = segment[segment["high"] > entry_price]
+                    if len(above_entry) > 0:
+                        weights = above_entry["volume"].values
+                        if weights.sum() > 0:
+                            target = np.average(above_entry["high"].values, weights=weights)
+                        else:
+                            target = above_entry["high"].mean()
+                        min_target = entry_price + atr * min_atr_mult
+                        return max(target, min_target)
+                else:
+                    below_entry = segment[segment["low"] < entry_price]
+                    if len(below_entry) > 0:
+                        weights = below_entry["volume"].values
+                        if weights.sum() > 0:
+                            target = np.average(below_entry["low"].values, weights=weights)
+                        else:
+                            target = below_entry["low"].mean()
+                        max_target = entry_price - atr * min_atr_mult
+                        return min(target, max_target)
+
+            # Fallback: ATR-based target
+            return entry_price + direction * atr * 2.0
 
     def _compute_atr(self, df: pd.DataFrame, idx: int) -> float:
         """Compute ATR at a specific bar."""

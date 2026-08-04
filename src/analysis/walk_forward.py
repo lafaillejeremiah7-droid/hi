@@ -86,6 +86,7 @@ class WalkForwardAnalyzer:
         session_timezone: str = "US/Eastern",
         point_value: float = 20.0,
         exit_management: dict | None = None,
+        close_at_end: bool = False,
     ):
         """Initialize walk-forward analyzer.
 
@@ -104,6 +105,7 @@ class WalkForwardAnalyzer:
             session_timezone: Timezone for session filtering.
             point_value: Dollar value per point.
             exit_management: Dict with exit management parameters.
+            close_at_end: Close any position still open on a window's last bar.
         """
         self.strategy = strategy
         self.cost_model = cost_model
@@ -118,6 +120,7 @@ class WalkForwardAnalyzer:
         self.session_timezone = session_timezone
         self.point_value = point_value
         self.exit_management = exit_management or {}
+        self.close_at_end = close_at_end
 
     def _generate_windows(
         self, df: pd.DataFrame
@@ -278,6 +281,7 @@ class WalkForwardAnalyzer:
                 trading_session_end=self.trading_session_end,
                 session_timezone=self.session_timezone,
                 exit_management=self.exit_management,
+                close_at_end=self.close_at_end,
             )
 
             # Optimize on train (use smaller subsample for speed in WF)
@@ -450,6 +454,7 @@ class WalkForwardAnalyzer:
         trading_session_start: str | None = None,
         trading_session_end: str | None = None,
         session_timezone: str = "US/Eastern",
+        close_at_end: bool = False,
     ) -> "WalkForwardAnalyzer":
         """Create WalkForwardAnalyzer from configuration dict.
 
@@ -461,6 +466,7 @@ class WalkForwardAnalyzer:
             trading_session_start: Session start.
             trading_session_end: Session end.
             session_timezone: Timezone.
+            close_at_end: Close any position still open on a window's last bar.
 
         Returns:
             Configured WalkForwardAnalyzer instance.
@@ -486,4 +492,5 @@ class WalkForwardAnalyzer:
             session_timezone=session_timezone,
             point_value=point_value,
             exit_management=exit_mgmt_config,
+            close_at_end=close_at_end,
         )

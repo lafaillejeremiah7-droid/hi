@@ -1,15 +1,20 @@
 """Tests for trading strategies.
 
-Tests signal generation on synthetic data for both the Order Flow
-and Volume Profile strategies, and the Combined/Confluence strategy.
+Tests signal generation on synthetic data for the primary SimpleStrategy
+and for the Order Flow / Volume Profile baselines.
 """
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from src.strategies.combined_strategy import CombinedStrategy
 from src.strategies.order_flow_strategy import OrderFlowStrategy
+from src.strategies.simple_strategy import (
+    PROFILE_BIN_WIDTH_POINTS,
+    SimpleStrategy,
+    heavy_volume_node,
+    rolling_delta_zscore,
+)
 from src.strategies.volume_profile_strategy import VolumeProfileStrategy
 
 
@@ -333,144 +338,247 @@ class TestVolumeProfileStrategy:
         assert "setup_type" in result.columns
 
 
-class TestCombinedStrategy:
-    """Tests for CombinedStrategy (VP + OF confluence)."""
+def make_orderflow_data(n: int = 300, seed: int = 7) -> pd.DataFrame:
+    """Create synthetic 5-min data with a real order flow delta column.
 
-    def test_initialization(self):
-        """Strategy initializes with default parameters."""
-        strategy = CombinedStrategy()
-        assert strategy.params is not None
-        assert "confirmation_window" in strategy.params
-        assert strategy.params["confirmation_window"] == 2
+    Returns:
+        DataFrame with OHLCV, bid_volume, ask_volume and delta.
+    """
+    rng = np.random.default_rng(seed)
+    dates = pd.date_range("2024-01-02 09:30", periods=n, freq="5min")
 
-    def test_custom_params(self):
-        """Strategy accepts custom parameters."""
-        custom = {"confirmation_window": 3}
-        strategy = CombinedStrategy(params=custom)
-        assert strategy.params["confirmation_window"] == 3
+    base = np.cumsum(rng.normal(0.0, 4.0, n)) + 18000
+    open_p = base + rng.normal(0, 1.0, n)
+    close_p = base + rng.normal(0, 1.0, n)
+    high_p = np.maximum(open_p, close_p) + np.abs(rng.normal(0, 3.0, n))
+    low_p = np.minimum(open_p, close_p) - np.abs(rng.normal(0, 3.0, n))
+    volume = rng.uniform(1000, 5000, n)
+    bid_volume = volume * rng.uniform(0.3, 0.7, n)
+    ask_volume = volume - bid_volume
 
-    def test_generate_signals_returns_dataframe(self):
-        """generate_signals returns DataFrame with expected columns."""
-        strategy = CombinedStrategy()
-        df = make_synthetic_ohlcv(200)
+    df = pd.DataFrame(
+        {
+            "open": open_p,
+            "high": high_p,
+            "low": low_p,
+            "close": close_p,
+            "volume": volume,
+            "bid_volume": bid_volume,
+            "ask_volume": ask_volume,
+            "delta": bid_volume - ask_volume,
+        },
+        index=dates,
+    )
+    return df
+
+
+def make_flat_bars(prices: list[float], volumes: list[float]) -> pd.DataFrame:
+    """Create bars where open=high=low=close so the typical price is exact."""
+    close = np.array(prices, dtype=float)
+    return pd.DataFrame(
+        {
+            "open": close,
+            "high": close,
+            "low": close,
+            "close": close,
+            "volume": np.array(volumes, dtype=float),
+        },
+        index=pd.date_range("2024-01-02 09:30", periods=len(prices), freq="5min"),
+    )
+
+
+class TestHeavyVolumeNode:
+    """Tests for the volume profile heavy-volume node."""
+
+    def test_picks_bin_with_most_volume(self):
+        """The node is the centre of the price bin holding the most volume."""
+        prices = [100.0, 100.0, 100.0, 200.0, 100.0]
+        volumes = [100.0, 100.0, 100.0, 5000.0, 100.0]
+        df = make_flat_bars(prices, volumes)
+
+        node = heavy_volume_node(df, lookback=5)
+
+        # Bin holding 200 is [200, 205), centre 202.5
+        assert node.iloc[4] == pytest.approx(202.5)
+
+    def test_nan_during_warmup(self):
+        """Bars before a full lookback window have no node."""
+        df = make_flat_bars([100.0] * 10, [100.0] * 10)
+        node = heavy_volume_node(df, lookback=5)
+
+        assert node.iloc[:4].isna().all()
+        assert node.iloc[4:].notna().all()
+
+    def test_window_is_trailing(self):
+        """The node only reflects the trailing lookback window."""
+        prices = [100.0, 100.0, 100.0, 100.0, 100.0, 300.0, 300.0, 300.0, 300.0, 300.0]
+        volumes = [1000.0] * 10
+        df = make_flat_bars(prices, volumes)
+
+        node = heavy_volume_node(df, lookback=5)
+
+        assert node.iloc[4] == pytest.approx(102.5)
+        assert node.iloc[9] == pytest.approx(302.5)
+
+    def test_bin_width_constant_is_positive(self):
+        """The profile bin width is a fixed positive constant."""
+        assert PROFILE_BIN_WIDTH_POINTS > 0
+
+
+class TestRollingDeltaZscore:
+    """Tests for the rolling delta Z-score."""
+
+    def test_nan_during_warmup(self):
+        """Z-score needs a full window before producing a value."""
+        df = make_orderflow_data(120)
+        z = rolling_delta_zscore(df, window=50)
+
+        assert z.iloc[:49].isna().all()
+        assert z.iloc[49:].notna().any()
+
+    def test_positive_delta_spike_gives_positive_zscore(self):
+        """A large positive delta produces a positive Z-score."""
+        df = make_orderflow_data(120)
+        df.loc[df.index[100], "delta"] = df["delta"].abs().max() * 10
+
+        z = rolling_delta_zscore(df, window=50)
+        assert z.iloc[100] > 0
+
+    def test_falls_back_to_volume_delta(self):
+        """Without a delta column the proxy volume_delta is used."""
+        df = make_orderflow_data(120).drop(columns=["delta"])
+        df["volume_delta"] = df["bid_volume"] - df["ask_volume"]
+
+        z = rolling_delta_zscore(df, window=50)
+        assert z.notna().any()
+
+    def test_raises_without_any_delta(self):
+        """A DataFrame with no delta information is an error."""
+        df = make_orderflow_data(60).drop(columns=["delta"])
+        with pytest.raises(KeyError):
+            rolling_delta_zscore(df, window=50)
+
+
+class TestSimpleStrategy:
+    """Tests for the primary SimpleStrategy."""
+
+    def test_tunable_surface_is_exactly_five_parameters(self):
+        """The strategy exposes only the documented parameters."""
+        strategy = SimpleStrategy()
+        assert set(strategy.params) == {
+            "profile_lookback",
+            "level_proximity_points",
+            "delta_threshold",
+            "stop_points",
+            "target_points",
+        }
+
+    def test_custom_params_override_defaults(self):
+        """Custom parameters replace the defaults."""
+        strategy = SimpleStrategy(params={"stop_points": 25, "target_points": 45})
+        assert strategy.params["stop_points"] == 25
+        assert strategy.params["target_points"] == 45
+
+    def test_generate_signals_returns_expected_columns(self):
+        """generate_signals returns signal, level and delta_zscore."""
+        strategy = SimpleStrategy()
+        df = make_orderflow_data(300)
         result = strategy.generate_signals(df)
 
-        assert isinstance(result, pd.DataFrame)
-        assert "signal" in result.columns
-        assert "vp_setup_type" in result.columns
-        assert "of_strength" in result.columns
+        assert list(result.columns) == ["signal", "level", "delta_zscore"]
         assert len(result) == len(df)
 
     def test_signals_are_valid_values(self):
-        """Signals are only -1, 0, or 1."""
-        strategy = CombinedStrategy()
-        df = make_synthetic_ohlcv(200)
+        """Signals are only -1, 0 or 1."""
+        strategy = SimpleStrategy()
+        df = make_orderflow_data(300)
         result = strategy.generate_signals(df)
 
         assert set(result["signal"].unique()).issubset({-1, 0, 1})
 
-    def test_combined_signals_subset_of_vp(self):
-        """Combined signals should be a subset of VP signals (more restrictive)."""
-        strategy = CombinedStrategy()
-        vp_strategy = VolumeProfileStrategy()
-        df = make_synthetic_ohlcv(300, trend="up")
-
-        combined_result = strategy.generate_signals(df)
-        vp_result = vp_strategy.generate_signals(df)
-
-        # Combined should have <= signals than VP alone (it requires OF confirmation)
-        combined_signal_count = (combined_result["signal"] != 0).sum()
-        vp_signal_count = (vp_result["signal"] != 0).sum()
-        assert combined_signal_count <= vp_signal_count
-
-    def test_no_signals_without_confluence(self):
-        """No signals when conditions are too strict for confluence."""
-        # Use very strict OF params so OF generates nothing
-        strategy = CombinedStrategy(params={
-            "of_params": {"min_signal_strength": 5, "min_relative_volume": 5.0},
-        })
-        df = make_synthetic_ohlcv(200)
+    def test_every_signal_satisfies_both_conditions(self):
+        """Each signal is at the level AND confirmed by delta."""
+        strategy = SimpleStrategy(
+            params={"level_proximity_points": 10, "delta_threshold": 1.0}
+        )
+        df = make_orderflow_data(600)
         result = strategy.generate_signals(df)
 
-        # With impossible OF requirements, no confluence possible
-        assert (result["signal"] == 0).all()
+        longs = result[result["signal"] == 1]
+        shorts = result[result["signal"] == -1]
 
-    def test_stop_loss_uses_vp_logic(self):
-        """Stop loss delegates to Volume Profile strategy."""
-        combined = CombinedStrategy()
-        vp = VolumeProfileStrategy()
-        df = make_synthetic_ohlcv(100)
-        entry_idx = 50
+        if len(longs) == 0 and len(shorts) == 0:
+            pytest.skip("No signals generated on synthetic data")
 
-        combined_sl = combined.get_stop_loss(df, entry_idx, direction=1)
-        vp_sl = vp.get_stop_loss(df, entry_idx, direction=1)
-        assert combined_sl == vp_sl
+        for rows, sign in ((longs, 1), (shorts, -1)):
+            for label, row in rows.iterrows():
+                distance = df.loc[label, "close"] - row["level"]
+                assert abs(distance) <= 10, "Signal fired away from the level"
+                assert distance * sign >= 0, "Level on the wrong side of price"
+                assert row["delta_zscore"] * sign >= 1.0, "Delta did not confirm"
 
-    def test_take_profit_uses_vp_logic(self):
-        """Take profit delegates to Volume Profile strategy."""
-        combined = CombinedStrategy()
-        vp = VolumeProfileStrategy()
-        df = make_synthetic_ohlcv(100)
-        entry_idx = 50
+    def test_higher_delta_threshold_is_more_selective(self):
+        """Raising the delta threshold cannot add signals."""
+        df = make_orderflow_data(600)
+        loose = SimpleStrategy(params={"delta_threshold": 0.5})
+        strict = SimpleStrategy(params={"delta_threshold": 1.5})
 
-        combined_tp = combined.get_take_profit(df, entry_idx, direction=1)
-        vp_tp = vp.get_take_profit(df, entry_idx, direction=1)
-        assert combined_tp == vp_tp
+        loose_n = (loose.generate_signals(df)["signal"] != 0).sum()
+        strict_n = (strict.generate_signals(df)["signal"] != 0).sum()
 
-    def test_stop_loss_long(self):
-        """Stop loss for long is below entry price."""
-        strategy = CombinedStrategy()
-        df = make_synthetic_ohlcv(100)
-        entry_idx = 50
-        sl = strategy.get_stop_loss(df, entry_idx, direction=1)
-        assert sl < df["close"].iloc[entry_idx]
+        assert strict_n <= loose_n
 
-    def test_stop_loss_short(self):
-        """Stop loss for short is above entry price."""
-        strategy = CombinedStrategy()
-        df = make_synthetic_ohlcv(100)
-        entry_idx = 50
-        sl = strategy.get_stop_loss(df, entry_idx, direction=-1)
-        assert sl > df["close"].iloc[entry_idx]
+    def test_wider_proximity_is_less_selective(self):
+        """Widening the level proximity cannot remove signals."""
+        df = make_orderflow_data(600)
+        narrow = SimpleStrategy(params={"level_proximity_points": 5})
+        wide = SimpleStrategy(params={"level_proximity_points": 10})
 
-    def test_take_profit_long(self):
-        """Take profit for long is above entry price."""
-        strategy = CombinedStrategy()
-        df = make_synthetic_ohlcv(100)
-        entry_idx = 50
-        tp = strategy.get_take_profit(df, entry_idx, direction=1)
-        assert tp > df["close"].iloc[entry_idx]
+        narrow_n = (narrow.generate_signals(df)["signal"] != 0).sum()
+        wide_n = (wide.generate_signals(df)["signal"] != 0).sum()
 
-    def test_take_profit_short(self):
-        """Take profit for short is below entry price."""
-        strategy = CombinedStrategy()
-        df = make_synthetic_ohlcv(100)
-        entry_idx = 50
-        tp = strategy.get_take_profit(df, entry_idx, direction=-1)
-        assert tp < df["close"].iloc[entry_idx]
+        assert wide_n >= narrow_n
 
-    def test_param_ranges(self):
-        """Strategy provides parameter ranges for optimization."""
-        strategy = CombinedStrategy()
-        ranges = strategy.get_param_ranges()
-        assert isinstance(ranges, dict)
-        assert "confirmation_window" in ranges
-        assert len(ranges) > 0
+    def test_stop_loss_is_fixed_points(self):
+        """Stop is exactly stop_points from entry on both sides."""
+        strategy = SimpleStrategy(params={"stop_points": 20})
+        df = make_orderflow_data(100)
+        entry = float(df["close"].iloc[50])
+
+        assert strategy.get_stop_loss(df, 50, 1) == pytest.approx(entry - 20)
+        assert strategy.get_stop_loss(df, 50, -1) == pytest.approx(entry + 20)
+
+    def test_take_profit_is_fixed_points(self):
+        """Target is exactly target_points from entry on both sides."""
+        strategy = SimpleStrategy(params={"target_points": 30})
+        df = make_orderflow_data(100)
+        entry = float(df["close"].iloc[50])
+
+        assert strategy.get_take_profit(df, 50, 1) == pytest.approx(entry + 30)
+        assert strategy.get_take_profit(df, 50, -1) == pytest.approx(entry - 30)
+
+    def test_take_profit_ignores_zscore(self):
+        """There is no extended target: the Z-score cannot change the target."""
+        strategy = SimpleStrategy(params={"target_points": 30})
+        df = make_orderflow_data(100)
+
+        plain = strategy.get_take_profit(df, 50, 1)
+        extreme = strategy.get_take_profit(df, 50, 1, feature_zscore=99.0)
+        assert plain == extreme
+
+    def test_param_ranges_cover_signal_parameters(self):
+        """Walk-forward re-optimizes only the two signal parameters."""
+        ranges = SimpleStrategy().get_param_ranges()
+        assert set(ranges) == {"delta_threshold", "level_proximity_points"}
 
     def test_strategy_name(self):
-        """Strategy has a proper name."""
-        strategy = CombinedStrategy()
-        assert strategy.name == "CombinedStrategy"
+        """Strategy reports its class name."""
+        assert SimpleStrategy().name == "SimpleStrategy"
 
-    def test_confirmation_window_effect(self):
-        """Larger confirmation window should allow more (or equal) signals."""
-        df = make_synthetic_ohlcv(300, trend="up")
+    def test_short_dataframe_produces_no_signals(self):
+        """Not enough bars for the profile means no signals."""
+        strategy = SimpleStrategy()
+        df = make_orderflow_data(20)
+        result = strategy.generate_signals(df)
 
-        narrow = CombinedStrategy(params={"confirmation_window": 1})
-        wide = CombinedStrategy(params={"confirmation_window": 3})
-
-        narrow_signals = (narrow.generate_signals(df)["signal"] != 0).sum()
-        wide_signals = (wide.generate_signals(df)["signal"] != 0).sum()
-
-        # Wider window should have >= signals (more chances for confluence)
-        assert wide_signals >= narrow_signals
+        assert (result["signal"] == 0).all()

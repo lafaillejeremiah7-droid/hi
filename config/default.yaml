@@ -15,7 +15,7 @@ data:
   trades_dir: "data/trades"
   # Databento settings (used if source is "databento" and file doesn't exist)
   databento:
-    api_key: "db-BVgxKmCkKcGSJE6cgepnTcJnaPEqn"
+    api_key: ""
     dataset: "GLBX.MDP3"
     symbol: "NQ.c.0"
     schema: "ohlcv-1m"
@@ -29,10 +29,13 @@ data:
     fallback_symbol: "^NDX"
     period: "730d"
     interval: "60m"
-  # Split ratios for 3.7 year coverage:
-  # Train: Jan 2021 - Dec 2022 (~2 years)
-  # Validation: Jan 2023 - Dec 2023 (~1 year)
-  # OOS: Jan 2024 - Sep 2024 (~9 months)
+  # Interleaved-block split (used by the pipeline). The timeline is cut into
+  # consecutive calendar-month blocks which are then assigned round-robin, so
+  # train / validation / OOS each span 2021 through 2024 instead of one
+  # contiguous era. Roughly 50% train / 25% validation / 25% OOS.
+  block_months: 1
+  block_assignment: ["train", "train", "validation", "oos"]
+  # Chronological split ratios (legacy, still used by the 3-way split helper)
   train_ratio: 0.54
   validation_ratio: 0.27
   # Legacy compatibility (deprecated, use train_ratio instead)
@@ -121,10 +124,20 @@ volume_profile_strategy:
   # ATR period
   atr_period: 14
 
-combined_strategy:
-  # How many bars the OF signal can lag/lead the VP level signal
-  confirmation_window: 3
-  # Max trades per day (scalping: 1-2)
+# Simple Strategy (PRIMARY) - heavy-volume level + real delta confirmation.
+# This is the entire tunable surface of the strategy.
+simple_strategy:
+  # Bars used to build the volume profile (78 = one 6.5h session on 5-min bars)
+  profile_lookback: 78
+  # How close price must be to the heavy-volume node to count as "at the level"
+  level_proximity_points: 10
+  # Minimum |delta Z-score| for order flow confirmation
+  delta_threshold: 1.0
+  # Fixed stop distance in points
+  stop_points: 20
+  # Fixed target distance in points
+  target_points: 30
+  # Max trades per day (enforced by the engine)
   max_trades_per_day: 2
   # Trading session start (Eastern Time)
   trading_session_start: "09:30"
@@ -132,30 +145,43 @@ combined_strategy:
   trading_session_end: "16:00"
   # Timezone for session filtering
   session_timezone: "US/Eastern"
-  # Stop loss placement (ATR multiplier, uses VP logic)
-  stop_loss_atr_mult: 1.0
-  # Take profit lookback for VP-based target (bars)
-  take_profit_lookback: 50
-  # ATR period
-  atr_period: 14
 
-# Dynamic Exit Management System
+# Parameter selection grid. Scored on TRAIN only; the top 5 by train score are
+# evaluated on VALIDATION and the single best is locked before OOS is touched.
+parameter_selection:
+  stop_points: [15, 20, 25, 30]
+  target_points: [20, 30, 40, 45, 60]
+  delta_threshold: [0.5, 1.0, 1.5]
+  level_proximity_points: [5, 10]
+  # Minimum trades on train for a combo to be considered valid
+  min_trades: 30
+  # How many train survivors get evaluated on validation
+  top_n_for_validation: 5
+
+# Exit management: fixed points only.
 exit_management:
-  # Stop loss: fixed at 1.0 ATR (does not change)
-  stop_loss_atr_mult: 1.0
-  # Default take profit: 1.5 ATR
-  take_profit_atr_mult: 1.5
-  # Extended take profit when |delta_zscore| >= threshold: 2.5 ATR
-  extended_take_profit_atr_mult: 2.5
-  # Z-score threshold for extended TP
-  feature_zscore_threshold: 2.5
-  # Partial close: triggered at 1.0 ATR profit in trade direction
-  partial_close_atr_mult: 1.0
-  # Fraction of position to close at partial trigger
+  # Stop loss mode: "fixed" (fixed points) or "atr" (ATR-based)
+  stop_loss_mode: "fixed"
+  # Fixed-point parameters. The SimpleStrategy supplies its own stop_points /
+  # target_points; these are the fallbacks used by the baseline strategies.
+  stop_loss_fixed_points: 20
+  take_profit_fixed_points: 30
+  # No partial closes and therefore no trailing stop
+  partial_close_enabled: false
   partial_close_fraction: 0.5
-  # Trailing stop distance (ATR multiplier from best price)
-  trailing_stop_atr_mult: 1.0
-  # Trailing stop activates after partial close
-  trailing_stop_activation: "partial_close"
   # Rolling window for delta Z-score computation
   delta_zscore_window: 50
+
+# Prop firm rules (FundedNext 50K) for the sizing analysis
+prop_firm:
+  account_size: 50000
+  profit_target: 3000
+  daily_loss_limit: 1000
+  equity_floor: 48000
+  micro_point_value: 2.0
+  mini_point_value: 20.0
+  max_micro_contracts: 40
+  max_mini_contracts: 4
+  trading_days_per_year: 250
+  simulations: 10000
+  seed: 42
