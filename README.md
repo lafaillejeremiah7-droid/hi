@@ -1,18 +1,24 @@
 # NAS100 Backtesting Framework
 
-Backtesting framework for NASDAQ 100 futures (NQ) on 5-minute bars with **real
-order flow** (bid/ask volume and delta aggregated from Databento trades).
+Backtesting framework for NASDAQ 100 futures (NQ). Two independent studies run
+end to end:
 
-The pipeline runs one deliberately simple strategy and validates it honestly:
-interleaved-block train/validation/OOS split, look-ahead regression tests,
-walk-forward analysis, Monte Carlo, and a FundedNext 50K prop-firm sizing
-analysis that respects the contract cap and the daily loss limit.
+1. **A Larry Williams daily-bar system** (primary) - Greatest Swing Value,
+   Oops!, Smash Day and TDOM seasonality on daily RTH bars, with stop-order
+   entries, multi-day holds and explicit overnight gap modelling.
+2. **`SimpleStrategy` on 5-minute bars with real order flow** (baseline) - kept
+   unchanged for comparison.
+
+Both are validated the same way: a train/validation/OOS split that is printed
+and auditable, a capped parameter grid scored on train only, look-ahead
+regression tests, walk-forward, and a FundedNext 50K sizing analysis that
+respects the contract cap and the daily loss limit.
 
 ## Quick Start
 
 ```bash
 uv sync
-uv run python -m src.main        # full pipeline
+uv run python -m src.main        # both studies
 uv run pytest tests/ -q          # test suite
 ```
 
@@ -21,7 +27,60 @@ Columns: `open, high, low, close, volume, bid_volume, ask_volume, delta,
 trade_count, avg_trade_size`, where `delta = bid_volume - ask_volume` so a
 **positive delta means net buying**.
 
-## The Strategy
+## The Williams Daily System (primary)
+
+Daily RTH bars (09:30-16:00 ET) are resampled from
+`data/NQ_1min_clean_2021_2026.parquet` and cached to `data/NQ_daily_rth.parquet`
+(1,417 trading days, Jan 2021 - Jul 2026), including each day's prior close so
+overnight gaps are measurable.
+
+Four components in `src/indicators/williams.py`, each measured **standalone on
+train** before anything is combined:
+
+| Component | Entry |
+|-----------|-------|
+| `gsv` | Buy stop at `open + GSV_buy x multiplier`, sell stop at `open - GSV_sell x multiplier`. `GSV_buy` averages `open - low` over the last N up-closing days; `GSV_sell` averages `high - open` over the last N down-closing days. |
+| `oops` | Open below yesterday's low, buy stop at yesterday's low (mirrored for shorts). |
+| `smash` | Yesterday closed below the prior N-day low, buy stop at yesterday's high (mirrored). |
+| `tdom` | Mean open-to-close return by trading-day-of-month index, **fitted on train only** and then frozen. Used as a bias/filter, never as a system. |
+
+Exits are fixed points plus a day-count exit: `stop_points`, `target_points`
+(fixed at 2x the stop, declared not tuned), `max_hold_days` counting the entry
+day as day 1, and an optional trailing stop on daily closes.
+
+`src/backtester/daily_engine.py` is a separate engine because the 5-minute
+engine enters at a bar's close and cannot represent a resting stop order. It
+models, in this order for every day: an **overnight gap through the stop**
+(stops are day orders, so the fill is the next session's open, not the stop),
+the intraday path (1-minute session paths locate the entry and exit minute, so
+stop-versus-target ordering is resolved rather than assumed; ties inside one
+minute go to the stop), the stop-order entry, the day-count exit, and the
+optional trailing exit.
+
+### Anti-overfitting
+
+- **Split** - straight chronological, with **5 trading days discarded between
+  segments** to kill autocorrelation leakage: train 50% / embargo / validation
+  20% / embargo / OOS ~30%. All five segments' date ranges and day counts are
+  printed. This is deliberately different from the interleaved-block split used
+  for the 5-minute study.
+- **Grid** - hard-capped at 40 combinations
+  (`src/analysis/daily_selection.py` raises above that). The grid is
+  `gsv_lookback x gsv_multiplier x stop_points x max_hold_days` = 36. Scored on
+  train, top 3 to validation, one locked, OOS touched once.
+- **Component selection** - a component is a candidate only if it is profitable
+  standalone on train; combinations are then compared on train and the winner
+  is reported with its reason.
+- **Look-ahead** - `tests/test_lookahead.py` asserts that GSV averages, all
+  three trigger sets, the TDOM table and the strategy's signals at bar *i* are
+  unchanged when every bar after *i* is deleted or replaced with noise.
+- **COT** - `src/data/cot.py` fetches the CFTC legacy Commitments of Traders
+  history and builds Williams' COT Index (commercial net position min-max
+  normalized over 156 weeks, mapped to daily bars with the Tuesday-to-Friday
+  publication lag). It is reported as a diagnostic only; if the fetch fails the
+  pipeline says plainly that COT is absent.
+
+## The Baseline Strategy
 
 `SimpleStrategy` (`src/strategies/simple_strategy.py`) has exactly two entry
 conditions - the core idea shared by the order flow and volume profile
@@ -57,7 +116,7 @@ for the OOS comparison table the pipeline prints.
 
 ## Validation Design
 
-### Interleaved-block split
+### Interleaved-block split (5-minute study only)
 
 The timeline is cut into consecutive 1-month blocks assigned round-robin:
 `train, train, validation, oos`. Each split therefore spans 2021 through 2024
@@ -108,26 +167,34 @@ limit, $48,000 equity floor, up to 40 Micro ($2/pt) or 4 Mini ($20/pt).
 ## Project Structure
 
 ```
-config/default.yaml              All parameters, grid and prop firm rules
+config/default.yaml              All parameters, grids and prop firm rules
 src/
   strategies/
-    simple_strategy.py           PRIMARY strategy (level + delta)
+    williams_strategy.py         PRIMARY: daily Williams components
+    simple_strategy.py           5-min baseline (level + delta)
     order_flow_strategy.py       baseline
     volume_profile_strategy.py   baseline
     base.py
   backtester/
-    engine.py                    Bar-by-bar simulation, session + daily caps
+    daily_engine.py              Daily stop-entry engine with gap fills
+    embargo_split.py             Chronological split with embargo gaps
+    engine.py                    5-min bar-by-bar simulation
     block_split.py               Interleaved-block split and per-block runs
     costs.py                     Volatility-scaled slippage + commission
   analysis/
-    parameter_selection.py       Train -> validation -> lock
+    daily_selection.py           Capped grid: train -> validation -> lock
+    parameter_selection.py       Same, for the 5-min study
     prop_firm.py                 FN 50K sizing, MC, arithmetic ceiling
     walk_forward.py              Rolling walk-forward windows
     metrics.py, monte_carlo.py
-  data/                          Fetching, trade aggregation, preprocessing
-  indicators/                    order_flow.py, volume_profile.py
+  data/
+    daily_bars.py                1-min -> daily RTH bars, cached
+    cot.py                       CFTC Commitments of Traders + COT Index
+    fetcher.py, preprocessor.py, trade_aggregator.py, importer.py
+  indicators/                    williams.py, order_flow.py, volume_profile.py
   reports/generator.py           Plotly HTML reports
-  main.py                        Pipeline orchestrator
+  williams_pipeline.py           Williams study orchestrator
+  main.py                        Runs both studies
 tests/                           Unit, look-ahead and split regression tests
 ```
 
@@ -135,11 +202,18 @@ tests/                           Unit, look-ahead and split regression tests
 
 These are printed by the pipeline as well:
 
-- **Overnight holds.** Bars outside 09:30-16:00 ET are filtered out before the
-  strategy runs, so a position held past the close never has its stop tested
-  against the overnight tape. The pipeline reports how many trades and how
-  much P&L this affects.
-- **Month confounding.** See the split section above.
+- **Overnight gaps dominate the daily system.** The median overnight gap on NQ
+  is ~69 points, larger than any stop the grid can choose. Gap fills on OOS
+  averaged ~98 points worse than the intended stop. This is the reason a daily
+  system and a $1,000 daily loss limit are close to incompatible.
+- **COT is absent from the traded system.** It is fetched and measured but did
+  not improve train P&L, so it was not adopted. Williams treated commercial
+  positioning as his primary bias, so only his timing tools are validated here.
+- **Overnight holds in the 5-minute study.** Bars outside 09:30-16:00 ET are
+  filtered out before that strategy runs, so a position held past the close
+  never has its stop tested against the overnight tape. The pipeline reports how
+  many trades and how much P&L this affects.
+- **Month confounding.** See the interleaved-block split section above.
 - **The contract cap dominates the return question.** Because the maximum size
   does not grow with equity, returns accumulate linearly, not exponentially.
 

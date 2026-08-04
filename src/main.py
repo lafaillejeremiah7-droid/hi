@@ -47,6 +47,7 @@ from src.reports.generator import generate_full_report
 from src.strategies.order_flow_strategy import OrderFlowStrategy
 from src.strategies.simple_strategy import SimpleStrategy
 from src.strategies.volume_profile_strategy import VolumeProfileStrategy
+from src.williams_pipeline import run_williams_pipeline
 
 SPLITS = ("train", "validation", "oos")
 
@@ -744,17 +745,38 @@ def print_final_summary(
 
 
 def main() -> None:
-    """Run the complete pipeline on 5-min NQ data with real order flow."""
+    """Run both studies: the Williams daily system and the SimpleStrategy baseline."""
+    pipeline_start = time.time()
+
+    config = load_config()
+
+    # The Williams daily-bar study is the primary question. The 5-minute
+    # SimpleStrategy run below is kept unchanged as a comparison baseline.
+    run_williams_pipeline(config)
+
+    print("\n\n")
+    run_simple_strategy_pipeline(config)
+
+    total_time = time.time() - pipeline_start
+    print(f"\n  Total time for both studies: {total_time:.0f}s "
+          f"({int(total_time // 60)}:{int(total_time % 60):02d})")
+
+
+def run_simple_strategy_pipeline(config: dict) -> None:
+    """Run the 5-minute SimpleStrategy study, unchanged, as the baseline.
+
+    Args:
+        config: Full configuration dict.
+    """
     pipeline_start = time.time()
 
     print("=" * 68)
-    print("  NAS100 Backtesting Framework - SimpleStrategy Pipeline")
+    print("  BASELINE FOR COMPARISON: SimpleStrategy on 5-minute bars")
     print("=" * 68)
 
     # Step 1: Configuration
     step_start = time.time()
     print("\n[1/8] Loading configuration...")
-    config = load_config()
     data_config = config.get("data", {})
     simple_config = dict(config.get("simple_strategy", {}))
     costs_config = config.get("costs", {})
@@ -986,9 +1008,8 @@ def main() -> None:
     print(f"  Step: {time.time() - step_start:.1f}s")
 
     total_time = time.time() - pipeline_start
-    print(f"\n  Total pipeline time: {total_time:.0f}s "
+    print(f"\n  Baseline pipeline time: {total_time:.0f}s "
           f"({int(total_time // 60)}:{int(total_time % 60):02d})")
-    print("\n  Done.")
 
 
 if __name__ == "__main__":

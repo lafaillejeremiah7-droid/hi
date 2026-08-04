@@ -25,7 +25,17 @@ from src.strategies.simple_strategy import (
     heavy_volume_node,
     rolling_delta_zscore,
 )
+from src.indicators.williams import (
+    greatest_swing_values,
+    gsv_triggers,
+    oops_triggers,
+    smash_day_triggers,
+    tdom_bias_flags,
+    tdom_bias_table,
+    trading_day_of_month,
+)
 from src.strategies.volume_profile_strategy import VolumeProfileStrategy
+from src.strategies.williams_strategy import WilliamsStrategy
 
 
 def make_test_data(n: int = 200, seed: int = 42) -> pd.DataFrame:
@@ -456,3 +466,234 @@ class TestSimpleStrategyNoLookahead:
                 f"SimpleStrategy signal at bar {bar_idx} changed when future data "
                 f"was corrupted. This indicates lookahead bias."
             )
+
+
+def make_daily_test_data(n: int = 400, seed: int = 23) -> pd.DataFrame:
+    """Create daily RTH bars for the Williams look-ahead tests.
+
+    Args:
+        n: Number of trading days.
+        seed: Random seed.
+
+    Returns:
+        DataFrame with the columns the Williams components read.
+    """
+    rng = np.random.default_rng(seed)
+    index = pd.date_range("2021-01-04", periods=n, freq="B", tz="US/Eastern") + pd.Timedelta(
+        hours=9, minutes=30
+    )
+
+    base = np.cumsum(rng.normal(0, 70, n)) + 14000
+    open_p = base + rng.normal(0, 25, n)
+    close_p = base + rng.normal(0, 25, n)
+    high_p = np.maximum(open_p, close_p) + np.abs(rng.normal(0, 50, n))
+    low_p = np.minimum(open_p, close_p) - np.abs(rng.normal(0, 50, n))
+
+    df = pd.DataFrame(
+        {"open": open_p, "high": high_p, "low": low_p, "close": close_p},
+        index=index,
+    )
+    df.index.name = "Date"
+    df["volume"] = rng.uniform(1e5, 1e6, n)
+    df["n_bars"] = 390
+    df["prior_close"] = df["close"].shift(1)
+    high_first = rng.random(n) < 0.5
+    df["high_time"] = np.where(high_first, index + pd.Timedelta(hours=1),
+                               index + pd.Timedelta(hours=3))
+    df["low_time"] = np.where(high_first, index + pd.Timedelta(hours=3),
+                              index + pd.Timedelta(hours=1))
+    return df
+
+
+# Bars checked by the Williams truncation tests: a mix of positions well past
+# the indicator warm-up.
+WILLIAMS_TRUNCATION_BARS = [60, 97, 155, 201, 280, 333, 399]
+
+
+class TestWilliamsIndicatorsNoLookahead:
+    """Every Williams component at bar i must use only bars <= i."""
+
+    def test_gsv_averages_unchanged_when_future_deleted(self):
+        """GSV averages at bar i survive deleting every bar after i."""
+        df = make_daily_test_data(400)
+        for lookback in (3, 5, 10):
+            full = greatest_swing_values(df, lookback)
+            for bar_idx in WILLIAMS_TRUNCATION_BARS:
+                truncated = greatest_swing_values(df.iloc[: bar_idx + 1], lookback)
+                for column in ("gsv_buy", "gsv_sell"):
+                    expected = full[column].iloc[bar_idx]
+                    actual = truncated[column].iloc[bar_idx]
+                    assert (pd.isna(expected) and pd.isna(actual)) or expected == pytest.approx(
+                        actual
+                    ), (
+                        f"{column} (N={lookback}) at bar {bar_idx} changed when all data "
+                        f"after bar {bar_idx} was deleted. This indicates lookahead bias."
+                    )
+
+    def test_gsv_triggers_unchanged_when_future_deleted(self):
+        """GSV entry stop levels at bar i survive truncation at i."""
+        df = make_daily_test_data(400)
+        full = gsv_triggers(df, lookback=5, multiplier=0.8)
+
+        for bar_idx in WILLIAMS_TRUNCATION_BARS:
+            truncated = gsv_triggers(df.iloc[: bar_idx + 1], lookback=5, multiplier=0.8)
+            for column in ("long_trigger", "short_trigger"):
+                expected = full[column].iloc[bar_idx]
+                actual = truncated[column].iloc[bar_idx]
+                assert (pd.isna(expected) and pd.isna(actual)) or expected == pytest.approx(
+                    actual
+                ), f"GSV {column} at bar {bar_idx} depends on future data."
+
+    def test_oops_triggers_unchanged_when_future_deleted(self):
+        """Oops! levels at bar i survive truncation at i."""
+        df = make_daily_test_data(400)
+        full = oops_triggers(df)
+
+        for bar_idx in WILLIAMS_TRUNCATION_BARS:
+            truncated = oops_triggers(df.iloc[: bar_idx + 1])
+            for column in ("long_trigger", "short_trigger"):
+                expected = full[column].iloc[bar_idx]
+                actual = truncated[column].iloc[bar_idx]
+                assert (pd.isna(expected) and pd.isna(actual)) or expected == pytest.approx(
+                    actual
+                ), f"Oops {column} at bar {bar_idx} depends on future data."
+
+    def test_smash_day_triggers_unchanged_when_future_deleted(self):
+        """Smash Day levels at bar i survive truncation at i."""
+        df = make_daily_test_data(400)
+        full = smash_day_triggers(df, lookback=5)
+
+        for bar_idx in WILLIAMS_TRUNCATION_BARS:
+            truncated = smash_day_triggers(df.iloc[: bar_idx + 1], lookback=5)
+            for column in ("long_trigger", "short_trigger"):
+                expected = full[column].iloc[bar_idx]
+                actual = truncated[column].iloc[bar_idx]
+                assert (pd.isna(expected) and pd.isna(actual)) or expected == pytest.approx(
+                    actual
+                ), f"Smash Day {column} at bar {bar_idx} depends on future data."
+
+    def test_trading_day_of_month_unchanged_when_future_deleted(self):
+        """The trading-day-of-month index at bar i survives truncation at i."""
+        df = make_daily_test_data(400)
+        full = trading_day_of_month(df.index)
+
+        for bar_idx in WILLIAMS_TRUNCATION_BARS:
+            truncated = trading_day_of_month(df.index[: bar_idx + 1])
+            assert full.iloc[bar_idx] == truncated.iloc[bar_idx], (
+                f"TDOM index at bar {bar_idx} depends on future data."
+            )
+
+    def test_tdom_table_reads_only_the_rows_it_is_given(self):
+        """A TDOM table fitted on bars <= i is unaffected by bars after i."""
+        df = make_daily_test_data(400)
+
+        for bar_idx in WILLIAMS_TRUNCATION_BARS:
+            from_prefix = tdom_bias_table(df.iloc[: bar_idx + 1], min_observations=3)
+            corrupted = df.copy()
+            corrupted.iloc[bar_idx + 1 :, corrupted.columns.get_loc("close")] += 5000
+            corrupted.iloc[bar_idx + 1 :, corrupted.columns.get_loc("open")] -= 5000
+            from_corrupted = tdom_bias_table(
+                corrupted.iloc[: bar_idx + 1], min_observations=3
+            )
+            assert from_prefix == from_corrupted, (
+                f"TDOM table fitted through bar {bar_idx} changed when later bars were "
+                f"corrupted. This indicates lookahead bias."
+            )
+
+    def test_tdom_flags_unchanged_when_future_deleted(self):
+        """Bias flags at bar i depend only on the frozen table and the calendar."""
+        df = make_daily_test_data(400)
+        table = tdom_bias_table(df.iloc[:200], min_observations=3)
+        full = tdom_bias_flags(df.index, table)
+
+        for bar_idx in WILLIAMS_TRUNCATION_BARS:
+            truncated = tdom_bias_flags(df.index[: bar_idx + 1], table)
+            assert full.iloc[bar_idx] == truncated.iloc[bar_idx], (
+                f"TDOM bias flag at bar {bar_idx} depends on future data."
+            )
+
+
+class TestWilliamsStrategyNoLookahead:
+    """WilliamsStrategy signals at bar i must be identical after truncation at i."""
+
+    PARAM_SETS = [
+        {"components": ("gsv",), "gsv_lookback": 10, "gsv_multiplier": 1.0},
+        {"components": ("gsv", "oops"), "gsv_lookback": 5, "gsv_multiplier": 0.6},
+        {"components": ("gsv", "oops", "smash"), "gsv_lookback": 3,
+         "gsv_multiplier": 0.8, "smash_lookback": 5},
+    ]
+
+    def _assert_bar_matches(self, full, truncated, bar_idx, label):
+        """Assert every signal column agrees at one bar."""
+        for column in ("signal", "long_trigger", "short_trigger"):
+            expected = full[column].iloc[bar_idx]
+            actual = truncated[column].iloc[bar_idx]
+            if isinstance(expected, float) and pd.isna(expected):
+                assert pd.isna(actual), (
+                    f"{label}: {column} at bar {bar_idx} became {actual} when all data "
+                    f"after bar {bar_idx} was deleted. This indicates lookahead bias."
+                )
+            else:
+                assert expected == pytest.approx(actual), (
+                    f"{label}: {column} at bar {bar_idx} changed from {expected} to "
+                    f"{actual} when all data after bar {bar_idx} was deleted. "
+                    f"This indicates lookahead bias."
+                )
+
+    def test_signals_unchanged_when_future_deleted(self):
+        """The core regression: delete everything after bar i, signals at i are identical."""
+        df = make_daily_test_data(400)
+        table = tdom_bias_table(df.iloc[:200], min_observations=3)
+
+        for params in self.PARAM_SETS:
+            strategy = WilliamsStrategy(params={**params, "tdom_bias": table})
+            full = strategy.generate_signals(df)
+            label = "+".join(params["components"])
+
+            for bar_idx in WILLIAMS_TRUNCATION_BARS:
+                truncated = strategy.generate_signals(df.iloc[: bar_idx + 1])
+                self._assert_bar_matches(full, truncated, bar_idx, label)
+
+    def test_signals_unchanged_with_the_tdom_filter(self):
+        """The TDOM filter uses a frozen table, so truncation cannot move a signal."""
+        df = make_daily_test_data(400)
+        table = tdom_bias_table(df.iloc[:200], min_observations=3)
+        strategy = WilliamsStrategy(
+            params={"components": ("gsv",), "tdom_bias": table, "tdom_filter": True}
+        )
+        full = strategy.generate_signals(df)
+
+        for bar_idx in WILLIAMS_TRUNCATION_BARS:
+            truncated = strategy.generate_signals(df.iloc[: bar_idx + 1])
+            self._assert_bar_matches(full, truncated, bar_idx, "gsv+tdom filter")
+
+    def test_armed_signals_exist_so_the_test_is_meaningful(self):
+        """The fixture must actually arm triggers, or the test proves nothing."""
+        df = make_daily_test_data(400)
+        signals = WilliamsStrategy(params={"components": ("gsv",)}).generate_signals(df)
+
+        armed = signals.loc[df.index[WILLIAMS_TRUNCATION_BARS], "long_trigger"].notna()
+        assert armed.any(), "Fixture produced no armed triggers at the tested bars"
+
+    def test_signals_unchanged_when_future_corrupted(self):
+        """Replacing future bars with noise cannot change a signal at bar i."""
+        df = make_daily_test_data(400)
+        strategy = WilliamsStrategy(
+            params={"components": ("gsv", "oops", "smash"), "gsv_lookback": 5}
+        )
+        full = strategy.generate_signals(df)
+
+        rng = np.random.default_rng(5)
+        for bar_idx in WILLIAMS_TRUNCATION_BARS[:-1]:
+            corrupted = df.copy()
+            n_future = len(df) - bar_idx - 1
+            noise = rng.uniform(40000, 50000, n_future)
+            for column, offset in (("open", 0.0), ("close", 5.0), ("high", 200.0),
+                                   ("low", -200.0)):
+                corrupted.iloc[bar_idx + 1 :, corrupted.columns.get_loc(column)] = (
+                    noise + offset
+                )
+            corrupted["prior_close"] = corrupted["close"].shift(1)
+
+            corrupted_signals = strategy.generate_signals(corrupted)
+            self._assert_bar_matches(full, corrupted_signals, bar_idx, "gsv+oops+smash")
